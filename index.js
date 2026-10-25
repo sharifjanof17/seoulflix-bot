@@ -10,6 +10,7 @@ const serviceAccount = JSON.parse(
     Buffer.from(process.env.GOOGLE_APPLICATION_CREDENTIALS, "base64").toString("utf-8")
 );
 
+
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
 });
@@ -18,6 +19,9 @@ const db = admin.firestore();
 const userStates = {};
 const advData = {};
 const filmDrafts = {};
+const episodeTemplates = {};
+
+
 
 const FILM_OPTIONAL_STEPS = [
     { key: "episode", label: "🎞️ Nechchi qismligini yuboring (masalan: 16 qism):" },
@@ -45,6 +49,72 @@ async function askFilmStep(ctx, index) {
             [Markup.button.callback("⏭ Otkazib yuborish", "film_skip")],
             [Markup.button.callback("❌ Bekor qilish", "film_cancel")],
         ])
+    );
+}
+
+// Bazadagi eng katta raqamli kod + 1 (0012 kabi, uzunligini saqlaydi)
+async function getNextCode() {
+    const snap = await db.collection("films").get();
+    let max = 0, width = 4;
+    snap.forEach((d) => {
+        if (/^\d+$/.test(d.id)) {
+            max = Math.max(max, parseInt(d.id, 10));
+            width = Math.max(width, d.id.length);
+        }
+    });
+    return String(max + 1).padStart(width, "0");
+}
+
+// "Drama nomi 1-qism" -> "Drama nomi 2-qism"
+function suggestNextTitle(title) {
+    const m = (title || "").match(/(\d+)(?!.*\d)/);
+    if (!m) return null;
+    return title.slice(0, m.index) + (parseInt(m[1], 10) + 1) + title.slice(m.index + m[1].length);
+}
+
+async function askNextEpisode(ctx) {
+    const userId = ctx.from.id;
+    userStates[userId] = "waiting_for_ep_code";
+    const nextCode = await getNextCode();
+    await ctx.reply(
+        "🔑 Yangi qism kodini yuboring:",
+        Markup.inlineKeyboard([
+            [Markup.button.callback(`🔢 Avtomatik kod: ${nextCode}`, "ep_autocode")],
+            [Markup.button.callback("✅ Tugatish", "ep_finish")],
+        ])
+    );
+}
+
+async function acceptEpisodeCode(ctx, code) {
+    const userId = ctx.from.id;
+    if (code.includes("/")) {
+        return ctx.reply("❌ Kodda \"/\" belgisi bo'lishi mumkin emas. Boshqa kod yuboring:");
+    }
+    const existing = await db.collection("films").doc(code).get();
+    if (existing.exists) {
+        return ctx.reply(`⚠️ "${code}" kodi band. Boshqa kod yuboring:`);
+    }
+    const tpl = episodeTemplates[userId];
+    filmDrafts[userId] = { ...tpl.base, code };
+    userStates[userId] = "waiting_for_ep_title";
+
+    const suggested = suggestNextTitle(tpl.lastTitle);
+    const buttons = [];
+    if (suggested) buttons.push([Markup.button.callback(`✅ ${suggested}`, "ep_title_suggest")]);
+    buttons.push([Markup.button.callback("❌ Bekor qilish", "film_cancel")]);
+
+    await ctx.reply(
+        `🎬 Qism nomini yuboring (masalan: ${suggested || "Drama nomi 2-qism"})` +
+        (suggested ? "\n\nYoki taklif qilingan nomni bosing 👇" : ""),
+        Markup.inlineKeyboard(buttons)
+    );
+}
+
+async function askEpisodeVideo(ctx) {
+    userStates[ctx.from.id] = "waiting_for_film_video";
+    await ctx.reply(
+        "🎥 Endi shu qism videosini yuboring:",
+        Markup.inlineKeyboard([[Markup.button.callback("❌ Bekor qilish", "film_cancel")]])
     );
 }
 
@@ -179,7 +249,7 @@ bot.start(async (ctx) => {
     if (userId === ADMIN_ID) {
         keyboard.push(["📢 Reklama yuborish", "👥 Obunachilar soni"]);
         keyboard.push(["📡 Majburiy kanallar", "🎬 Drama qo'shish"]);
-        keyboard.push(["⭐ Yuklab olish ruxsati"]);
+        keyboard.push(["⭐ Yuklab olish ruxsati", "➕ Qism qo'shish"]);
     }
 
     try {
@@ -256,10 +326,22 @@ bot.on("video", async (ctx) => {
         await db.collection("films").doc(draft.code).set(filmData);
         delete userStates[userId];
         delete filmDrafts[userId];
-        return ctx.reply(
-            `✅ Drama muvaffaqiyatli qo'shildi!\n\n🎬 *${filmData.title}*\n🔑 Kod: \`${draft.code}\``,
-            { parse_mode: "Markdown" }
-        );
+
+        const savedMsg = `✅ Qo'shildi!\n\n🎬 *${filmData.title}*\n🔑 Kod: \`${draft.code}\``;
+
+        // Qism qo'shish rejimida bo'lsa — keyingisiga o'tish tugmalari
+        if (episodeTemplates[userId]) {
+            episodeTemplates[userId].lastTitle = filmData.title;
+            return ctx.reply(savedMsg, {
+                parse_mode: "Markdown",
+                ...Markup.inlineKeyboard([
+                    [Markup.button.callback("➕ Keyingi qism", "ep_next")],
+                    [Markup.button.callback("✅ Tugatish", "ep_finish")],
+                ]),
+            });
+        }
+
+        return ctx.reply(savedMsg, { parse_mode: "Markdown" });
     }
 
     // Admin reklama uchun video yuborayotgan bo'lsa
@@ -460,6 +542,52 @@ bot.action(/^remove_vip:(.+)$/, async (ctx) => {
     await ctx.reply(`✅ @${uname} ro'yxatdan o'chirildi.`);
 });
 
+bot.hears("➕ Qism qo'shish", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.reply("❌ Siz admin emassiz!");
+    delete episodeTemplates[ctx.from.id];
+    delete filmDrafts[ctx.from.id];
+    userStates[ctx.from.id] = "waiting_for_ep_base";
+    await ctx.reply(
+        "➕ *Yangi qism qo'shish*\n\nShu dramaning avval qo'shilgan istalgan qismi kodini yuboring (masalan, 1-qism kodi). Ma'lumotlar o'sha qismdan nusxalanadi.",
+        {
+            parse_mode: "Markdown",
+            ...Markup.inlineKeyboard([[Markup.button.callback("❌ Bekor qilish", "film_cancel")]]),
+        }
+    );
+});
+
+bot.action("ep_autocode", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    if (userStates[ctx.from.id] !== "waiting_for_ep_code") return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    await acceptEpisodeCode(ctx, await getNextCode());
+});
+
+bot.action("ep_title_suggest", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    const userId = ctx.from.id;
+    if (userStates[userId] !== "waiting_for_ep_title") return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    filmDrafts[userId].title = suggestNextTitle(episodeTemplates[userId].lastTitle);
+    await askEpisodeVideo(ctx);
+});
+
+bot.action("ep_next", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    if (!episodeTemplates[ctx.from.id]) return ctx.answerCbQuery();
+    await ctx.answerCbQuery();
+    await askNextEpisode(ctx);
+});
+
+bot.action("ep_finish", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    delete episodeTemplates[ctx.from.id];
+    delete userStates[ctx.from.id];
+    delete filmDrafts[ctx.from.id];
+    await ctx.answerCbQuery("Tugatildi.");
+    await ctx.reply("✅ Qismlar qo'shish yakunlandi.");
+});
+
 bot.hears("🎬 Drama qo'shish", async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.reply("❌ Siz admin emassiz!");
     userStates[ctx.from.id] = "waiting_for_film_code";
@@ -485,6 +613,7 @@ bot.action("film_cancel", async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
     delete userStates[ctx.from.id];
     delete filmDrafts[ctx.from.id];
+    delete episodeTemplates[ctx.from.id];
     await ctx.answerCbQuery("Bekor qilindi.");
     await ctx.reply("❌ Drama qo'shish bekor qilindi.");
 });
@@ -514,13 +643,26 @@ bot.hears("📜 Kino roʻyxati", async (ctx) => {
     const snapshot = await db.collection("films").get();
     if (snapshot.empty) return ctx.reply("❌ Hozircha bazaga hech qanday drama qo'shilmagan.");
 
-    let message = "🎬 *SeoulFlix Drama Ro'yxati*\n";
-    snapshot.forEach((doc) => {
-        const film = doc.data();
-        const views = film.views || 0;
-        message += `\n🎬 *${film.title}* — Kod: \`${doc.id}\` | 👁 ${views}`;
-    });
-    await ctx.reply(message, { parse_mode: "Markdown" });
+    // Kino kodi bo'yicha tartiblash (0001, 0002, ... 0010 to'g'ri tartibda chiqadi)
+    const films = snapshot.docs
+        .map((doc) => ({ code: doc.id, title: doc.data().title }))
+        .sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true }));
+
+    const header = "🎬 *SeoulFlix Drama Ro'yxati*\n";
+    let message = header;
+
+    for (const film of films) {
+        const line = `\n🎬 *${film.title}* — Kod: \`${film.code}\``;
+
+        // Telegram xabar limiti 4096 belgi, shuning uchun bo'lib yuboramiz
+        if ((message + line).length > 4000) {
+            await ctx.reply(message, { parse_mode: "Markdown" });
+            message = "";
+        }
+        message += line;
+    }
+
+    if (message) await ctx.reply(message, { parse_mode: "Markdown" });
 });
 
 bot.hears("🔍 Kino izlash", async (ctx) => {
@@ -538,7 +680,7 @@ bot.on("text", async (ctx) => {
     const text = ctx.message.text.trim();
 
     // Klaviatura tugmalarini o'tkazib yuborish
-    const keyboardButtons = ["📜 Kino roʻyxati", "🔍 Kino izlash", "📢 Reklama yuborish", "👥 Obunachilar soni", "📡 Majburiy kanallar", "🎬 Drama qo'shish", "⭐ Yuklab olish ruxsati"];
+    const keyboardButtons = ["📜 Kino roʻyxati", "🔍 Kino izlash", "📢 Reklama yuborish", "👥 Obunachilar soni", "📡 Majburiy kanallar", "🎬 Drama qo'shish", "⭐ Yuklab olish ruxsati", "➕ Qism qo'shish"];
     if (keyboardButtons.includes(text)) return;
 
     // ── ADMIN: yuklab olish ruxsati uchun foydalanuvchi qo'shish ──
