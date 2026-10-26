@@ -683,6 +683,26 @@ bot.on("text", async (ctx) => {
     const keyboardButtons = ["📜 Kino roʻyxati", "🔍 Kino izlash", "📢 Reklama yuborish", "👥 Obunachilar soni", "📡 Majburiy kanallar", "🎬 Drama qo'shish", "⭐ Yuklab olish ruxsati", "➕ Qism qo'shish"];
     if (keyboardButtons.includes(text)) return;
 
+    // ── ADMIN: qism qo'shish — namuna qism kodi ──
+    if (userId === ADMIN_ID && userStates[userId] === "waiting_for_ep_base") {
+        const baseDoc = await db.collection("films").doc(text).get();
+        if (!baseDoc.exists) return ctx.reply("❌ Bunday kodli drama topilmadi. Qaytadan yuboring:");
+        const { video_link, views, ...base } = baseDoc.data();
+        episodeTemplates[userId] = { base, lastTitle: base.title || "" };
+        return askNextEpisode(ctx);
+    }
+
+    // ── ADMIN: qism qo'shish — yangi kod ──
+    if (userId === ADMIN_ID && userStates[userId] === "waiting_for_ep_code") {
+        return acceptEpisodeCode(ctx, text);
+    }
+
+    // ── ADMIN: qism qo'shish — nom ──
+    if (userId === ADMIN_ID && userStates[userId] === "waiting_for_ep_title") {
+        filmDrafts[userId].title = text;
+        return askEpisodeVideo(ctx);
+    }
+
     // ── ADMIN: yuklab olish ruxsati uchun foydalanuvchi qo'shish ──
     if (userId === ADMIN_ID && userStates[userId] === "waiting_for_vip_add") {
         const username = text.trim();
