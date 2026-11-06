@@ -37,6 +37,11 @@ const advData = {};
 const filmDrafts = {};
 const episodeTemplates = {};
 const vipAdminTarget = {};
+const editTarget = {}; // admin: tahrirlanayotgan qism { code, field }
+
+// Yangi qism xabarnomalari
+const NOTIFY_ENABLED = true;   // false bo'lsa, yangi qism haqida avtomatik xabar yuborilmaydi
+const NOTIFY_DELAY_MIN = 3;    // oxirgi qism qo'shilgandan necha daqiqa keyin yuboriladi (ketma-ket qismlar bitta xabarga yig'iladi)
 
 // Klaviatura tugmalari (bir joyda, xato qilmaslik uchun)
 const BTN = {
@@ -44,14 +49,17 @@ const BTN = {
     SEARCH: "🔍 Kino izlash",
     VIP: "💎 VIP",
     ADV: "📢 Reklama yuborish",
-    COUNT: "👥 Obunachilar soni",
+    COUNT: "📈 Statistika",
     CHANNELS: "📡 Majburiy kanallar",
     ADD_DRAMA: "🎬 Drama qo'shish",
     ADD_EP: "➕ Qism qo'shish",
     DOWNLOAD: "⭐ Yuklab olish ruxsati",
     VIP_ADMIN: "💎 VIP boshqaruvi",
+    EDIT_EP: "✏️ Qismni tahrirlash",
 };
-const MENU_BUTTONS = Object.values(BTN);
+// Eski klaviaturada qolgan tugma nomlari (admin /start bosmaguncha ishlashi uchun)
+const LEGACY_COUNT_BTN = "👥 Obunachilar soni";
+const MENU_BUTTONS = [...Object.values(BTN), LEGACY_COUNT_BTN];
 
 const FILM_OPTIONAL_STEPS = [
     { key: "episode", label: "🎞️ Nechanchi qism ekanini yuboring (masalan: 1 yoki 1-qism):" },
@@ -119,8 +127,57 @@ function displayName(u) {
     return full || u.username || String(u.userId);
 }
 
+// Har qanday ko'rinishdagi sanani millisekundga aylantiradi
+// (Firestore Timestamp, Date, son, "dd.mm.yyyy" yoki ISO matn — qo'lda kiritilgan VIP'lar ham hisoblanadi)
 function tsToMs(ts) {
-    return ts && typeof ts.toMillis === "function" ? ts.toMillis() : 0;
+    if (!ts) return 0;
+    if (typeof ts.toMillis === "function") return ts.toMillis();
+    if (ts instanceof Date) return ts.getTime();
+    if (typeof ts === "number") return ts < 1e12 ? ts * 1000 : ts; // soniya yoki millisekund
+    if (typeof ts === "object") {
+        if (typeof ts._seconds === "number") return ts._seconds * 1000;
+        if (typeof ts.seconds === "number") return ts.seconds * 1000;
+    }
+    if (typeof ts === "string") {
+        const s = ts.trim();
+        if (/^\d+$/.test(s)) return tsToMs(Number(s));
+        const m = s.match(/^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$/);
+        if (m) {
+            // kun oxirigacha (Toshkent vaqti)
+            return Date.UTC(+m[3], +m[2] - 1, +m[1], 23, 59, 59) - 5 * 60 * 60 * 1000;
+        }
+        const parsed = Date.parse(s);
+        return isNaN(parsed) ? 0 : parsed;
+    }
+    return 0;
+}
+
+// "29 000", "29000 so'm", 29000 -> 29000
+function parseAmount(v) {
+    if (typeof v === "number") return v;
+    const n = parseInt(String(v || "").replace(/\D/g, ""), 10);
+    return isNaN(n) ? 0 : n;
+}
+
+// Kun soniga mos narx (30 kun = VIP_PRICE)
+function priceForDays(days) {
+    return Math.round((VIP_PRICE * days) / VIP_DAYS);
+}
+
+async function sendChunks(ctx, header, lines, extra = { parse_mode: "HTML" }) {
+    const chunks = [];
+    let current = header;
+    for (const line of lines) {
+        // Telegram xabar limiti 4096 belgi
+        if (current.length + line.length + 1 > 3800) {
+            chunks.push(current);
+            current = line;
+        } else {
+            current += (current ? "\n" : "") + line;
+        }
+    }
+    if (current) chunks.push(current);
+    for (const chunk of chunks) await ctx.reply(chunk, extra);
 }
 
 async function loadDownloadUsers() {
@@ -207,14 +264,72 @@ function vipDocData(target, expiresMs, grantedBy, isNew) {
     return data;
 }
 
-async function grantVipDays(target, days, grantedBy) {
+// Admin qo'lda bergan VIP ham to'lov sifatida yoziladi.
+// amount = 0 bo'lsa "tekin" hisoblanadi va tushumga qo'shilmaydi.
+async function grantVipDays(target, days, grantedBy, amount = priceForDays(days)) {
     const ref = db.collection("vips").doc(String(target.userId));
+    const payRef = db.collection("payments").doc();
     return db.runTransaction(async (t) => {
         const snap = await t.get(ref);
         const expiresMs = calcExpiry(snap, days);
         t.set(ref, vipDocData(target, expiresMs, grantedBy, !snap.exists), { merge: true });
+        t.set(payRef, {
+            userId: Number(target.userId),
+            username: target.username || "",
+            firstName: target.firstName || "",
+            lastName: target.lastName || "",
+            amount,
+            free: amount === 0,
+            days,
+            status: "approved",
+            source: "admin",
+            createdAt: admin.firestore.Timestamp.now(),
+            decidedAt: admin.firestore.Timestamp.now(),
+        });
         return expiresMs;
     });
+}
+
+// Bir martalik: avval admin qo'lda bergan (to'lov yozuvi yo'q) VIP'lar uchun to'lov yozuvini tiklaydi
+async function backfillManualVipPayments() {
+    const [vipSnap, paySnap] = await Promise.all([
+        db.collection("vips").get(),
+        db.collection("payments").get(),
+    ]);
+    const paidUsers = new Set();
+    paySnap.forEach((d) => {
+        const p = d.data();
+        if (p.status === "approved" && p.userId !== undefined) paidUsers.add(String(p.userId));
+    });
+
+    let added = 0;
+    for (const doc of vipSnap.docs) {
+        const v = doc.data();
+        if (v.revenueBackfilled || paidUsers.has(doc.id)) continue;
+        const exp = tsToMs(v.expiresAt);
+        const start = tsToMs(v.startedAt) || (doc.createTime ? doc.createTime.toMillis() : 0);
+        if (!exp || !start || exp <= start) continue;
+
+        const days = Math.max(1, Math.round((exp - start) / DAY_MS));
+        const batch = db.batch();
+        batch.set(db.collection("payments").doc(), {
+            userId: Number(v.userId || doc.id),
+            username: v.username || "",
+            firstName: v.firstName || "",
+            lastName: v.lastName || "",
+            amount: priceForDays(days),
+            days,
+            status: "approved",
+            source: "admin",
+            backfilled: true,
+            createdAt: admin.firestore.Timestamp.fromMillis(start),
+            decidedAt: admin.firestore.Timestamp.now(),
+        });
+        batch.update(doc.ref, { revenueBackfilled: true });
+        await batch.commit();
+        added++;
+    }
+    if (added) console.log(`💎 ${added} ta qo'lda berilgan VIP uchun to'lov yozuvi tiklandi.`);
 }
 
 // To'lovni tasdiqlash: bir marta ishlashi kafolatlangan (qayta bosilsa ikki marta VIP bermaydi)
@@ -272,14 +387,32 @@ async function findPendingPayment(userId) {
 async function resolveUser(input) {
     const t = String(input).trim();
     if (/^\d+$/.test(t)) {
+        const id = Number(t);
         const d = await db.collection("users").doc(t).get();
-        return d.exists ? d.data() : null;
+        if (d.exists) return { ...d.data(), userId: id };
+        const v = await db.collection("vips").doc(t).get();
+        if (v.exists) return { ...v.data(), userId: id };
+        // Bazada yo'q bo'lsa ham ID bo'yicha ishlaymiz
+        try {
+            const chat = await bot.telegram.getChat(id);
+            return {
+                userId: id,
+                username: chat.username || "",
+                firstName: chat.first_name || "",
+                lastName: chat.last_name || "",
+            };
+        } catch (err) {
+            return { userId: id, username: "", firstName: "", lastName: "" };
+        }
     }
     const uname = t.replace(/^@/, "").toLowerCase();
     if (!uname) return null;
-    const snap = await db.collection("users").get();
-    const found = snap.docs.find((d) => String(d.data().username || "").toLowerCase() === uname);
-    return found ? found.data() : null;
+    for (const col of ["users", "vips"]) {
+        const snap = await db.collection(col).get();
+        const found = snap.docs.find((d) => String(d.data().username || "").toLowerCase() === uname);
+        if (found) return { ...found.data(), userId: Number(found.data().userId || found.id) };
+    }
+    return null;
 }
 
 function vipBenefitsText() {
@@ -392,17 +525,28 @@ async function applyVipWindow(dramaId) {
     const batch = db.batch();
     toOpen.forEach((d) => batch.update(d.ref, { vipOnly: false, openedAt: admin.firestore.Timestamp.now() }));
     await batch.commit();
-    return toOpen.map((d) => ({ code: d.id, episode: d.data().episode || "" }));
+    return toOpen.map((d) => ({
+        code: d.id,
+        episode: d.data().episode || "",
+        epNo: d.data().epNo,
+        title: d.data().title || "",
+    }));
 }
 
+// Ochilgan qismlar ro'yxatini qaytaradi
 async function openAllEpisodes(dramaId) {
     const snap = await db.collection("films").where("dramaId", "==", dramaId).get();
     const closed = snap.docs.filter((d) => d.data().vipOnly === true);
-    if (closed.length === 0) return 0;
+    if (closed.length === 0) return [];
     const batch = db.batch();
     closed.forEach((d) => batch.update(d.ref, { vipOnly: false, openedAt: admin.firestore.Timestamp.now() }));
     await batch.commit();
-    return closed.length;
+    return closed.map((d) => ({
+        code: d.id,
+        episode: d.data().episode || "",
+        epNo: d.data().epNo,
+        title: d.data().title || "",
+    }));
 }
 
 function makeTemplate(film, code) {
@@ -588,6 +732,7 @@ async function finalizeFilm(ctx, fileId) {
         return ctx.reply("❌ Saqlashda xatolik yuz berdi. Videoni qayta yuboring.");
     }
 
+    invalidateDramaCache();
     delete userStates[userId];
     delete filmDrafts[userId];
     episodeTemplates[userId] = makeTemplate(filmData, draft.code);
@@ -604,8 +749,33 @@ async function finalizeFilm(ctx, fileId) {
         msg += `\n\n🔓 Hammaga ochildi: ${list}`;
     }
 
+    // Kanal postlari uchun havolalar
+    const uname = botUsername(ctx);
+    if (uname && isDeepLinkSafe(draft.code)) {
+        msg += `\n\n🔗 Qism havolasi:\n<code>https://t.me/${uname}?start=${esc(draft.code)}</code>`;
+        const groups = await loadDramaGroups(true).catch(() => []);
+        const group = findGroupByCode(groups, draft.code);
+        if (group && isDeepLinkSafe(`dr_${group.key}`)) {
+            msg += `\n📜 Barcha qismlar havolasi:\n<code>https://t.me/${uname}?start=dr_${esc(group.key)}</code>`;
+        }
+    }
+
+    // Foydalanuvchilarga avtomatik xabarnoma (navbatga qo'yiladi)
+    const newEp = { code: draft.code, episode: filmData.episode, epNo: filmData.epNo, title: filmData.title };
+    enqueueNotify(newEp, filmData.vipOnly ? "vip" : "all");
+    opened.forEach((o) => enqueueNotify(o, "opened"));
+
     const buttons = [[Markup.button.callback("➕ Keyingi qism", "ep_next")]];
     if (filmData.vipOnly) buttons.push([Markup.button.callback("🔓 Dramani to'liq hammaga ochish", "ep_open_all")]);
+    if (NOTIFY_ENABLED) {
+        msg += `\n\n🔔 Foydalanuvchilarga xabarnoma ${NOTIFY_DELAY_MIN} daqiqadan keyin yuboriladi (shu orada qo'shilgan qismlar bitta xabarga jamlanadi).`;
+    }
+    if (NOTIFY_ENABLED && cbFits(`ntf_cancel:${draft.code}`)) {
+        buttons.push([
+            Markup.button.callback("📣 Hozir yuborish", `ntf_now:${draft.code}`),
+            Markup.button.callback("🔕 Yubormaslik", `ntf_cancel:${draft.code}`),
+        ]);
+    }
     buttons.push([Markup.button.callback("✅ Tugatish", "ep_finish")]);
 
     return ctx.reply(msg, { parse_mode: "HTML", ...Markup.inlineKeyboard(buttons) });
@@ -615,7 +785,13 @@ async function finalizeFilm(ctx, fileId) {
 // OBUNA TEKSHIRISH
 // ─────────────────────────────────────────────
 
-async function checkSubscription(ctx) {
+// "Tekshirish" tugmasi: kutilayotgan qism kodi bo'lsa, obunadan keyin o'sha qism darhol yuboriladi
+function checkButtonData(pendingCode) {
+    const data = pendingCode ? `chk:${pendingCode}` : "";
+    return data && Buffer.byteLength(data, "utf8") <= 64 ? data : "check_membership";
+}
+
+async function checkSubscription(ctx, pendingCode) {
     const userId = ctx.from.id;
     if (VIP_SKIPS_SUBSCRIPTION && (await hasVipAccess(userId))) return true;
 
@@ -624,7 +800,7 @@ async function checkSubscription(ctx) {
             const member = await bot.telegram.getChatMember(ch, userId);
             if (["left", "kicked"].includes(member.status)) {
                 const buttons = SHOW_CHANNELS.map((c) => [Markup.button.url(c.name, c.url)]);
-                buttons.push([Markup.button.callback("✅ Tekshirish", "check_membership")]);
+                buttons.push([Markup.button.callback("✅ Tekshirish", checkButtonData(pendingCode))]);
                 await ctx.reply(
                     "❌ Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling 👇",
                     Markup.inlineKeyboard(buttons)
@@ -700,11 +876,34 @@ async function sendAdvToAll(ctx, adv) {
 // MIDDLEWARE: oddiy foydalanuvchi menyu tugmasini bossa, kutish holati bekor bo'ladi
 // ─────────────────────────────────────────────
 
+// Statistika uchun: foydalanuvchi faolligini kuniga bir marta yozib qo'yamiz
+const lastTouchDay = new Map();
+function touchUser(from) {
+    if (!from || from.is_bot) return;
+    const day = fmtDate(Date.now());
+    if (lastTouchDay.get(from.id) === day) return;
+    lastTouchDay.set(from.id, day);
+    db.collection("users")
+        .doc(String(from.id))
+        .set(
+            {
+                userId: from.id,
+                firstName: from.first_name || "",
+                lastName: from.last_name || "",
+                username: from.username || "",
+                lastActiveAt: admin.firestore.Timestamp.now(),
+            },
+            { merge: true }
+        )
+        .catch((err) => console.error("touchUser:", err.message));
+}
+
 bot.use(async (ctx, next) => {
     const text = ctx.message && ctx.message.text;
     if (text && ctx.from && ctx.from.id !== ADMIN_ID && MENU_BUTTONS.includes(text.trim())) {
         delete userStates[ctx.from.id];
     }
+    if (ctx.chat && ctx.chat.type === "private") touchUser(ctx.from);
     return next();
 });
 
@@ -718,18 +917,22 @@ bot.start(async (ctx) => {
     delete filmDrafts[userId];
     delete episodeTemplates[userId];
     delete vipAdminTarget[userId];
+    delete editTarget[userId];
 
     const userRef = db.collection("users").doc(userId.toString());
     const doc = await userRef.get();
 
-    if (!doc.exists) {
-        await userRef.set({
-            userId,
-            firstName: ctx.from.first_name || "",
-            lastName: ctx.from.last_name || "",
-            username: ctx.from.username || "",
-            joinedAt: admin.firestore.Timestamp.now(),
-        });
+    if (!doc.exists || !doc.data().joinedAt) {
+        await userRef.set(
+            {
+                userId,
+                firstName: ctx.from.first_name || "",
+                lastName: ctx.from.last_name || "",
+                username: ctx.from.username || "",
+                joinedAt: admin.firestore.Timestamp.now(),
+            },
+            { merge: true }
+        );
     }
 
     const keyboard = [[BTN.LIST, BTN.SEARCH], [BTN.VIP]];
@@ -737,14 +940,25 @@ bot.start(async (ctx) => {
         keyboard.push([BTN.ADV, BTN.COUNT]);
         keyboard.push([BTN.CHANNELS, BTN.ADD_DRAMA]);
         keyboard.push([BTN.DOWNLOAD, BTN.ADD_EP]);
-        keyboard.push([BTN.VIP_ADMIN]);
+        keyboard.push([BTN.VIP_ADMIN, BTN.EDIT_EP]);
     }
+
+    // Havola orqali kelgan bo'lsa: t.me/bot?start=0012
+    const payload = (String((ctx.message && ctx.message.text) || "").split(/\s+/)[1] || "").trim();
 
     try {
         await ctx.reply(
-            "🎬 SeoulFlix botiga xush kelibsiz!\n\nQuyidagi tugmalar orqali istagan dramangizni topishingiz yoki drama kodini yuborishingiz mumkin 👇",
+            "🎬 SeoulFlix botiga xush kelibsiz!\n\nQuyidagi tugmalar orqali istagan dramangizni topishingiz, drama kodini yoki nomini yuborishingiz mumkin 👇",
             Markup.keyboard(keyboard).resize()
         );
+
+        if (payload && isDeepLinkSafe(payload)) {
+            const subscribed = await checkSubscription(ctx, payload);
+            if (!subscribed) return;
+            const opened = await openDeepLink(ctx, payload);
+            if (!opened) await ctx.reply("❌ Bu havoladagi qism topilmadi. «📜 Kino roʻyxati» tugmasidan foydalaning.");
+            return;
+        }
 
         const buttons = SHOW_CHANNELS.map((ch) => [Markup.button.url(ch.name, ch.url)]);
         buttons.push([Markup.button.callback("✅ Tekshirish", "check_membership")]);
@@ -762,10 +976,8 @@ bot.start(async (ctx) => {
     }
 });
 
-bot.action("check_membership", async (ctx) => {
-    const userId = ctx.from.id;
+async function getMissingChannels(userId) {
     const notSubscribed = [];
-
     for (const ch of CHECK_CHANNELS) {
         try {
             const res = await bot.telegram.getChatMember(ch, userId);
@@ -774,6 +986,26 @@ bot.action("check_membership", async (ctx) => {
             notSubscribed.push(ch);
         }
     }
+    return notSubscribed;
+}
+
+// Havola/qism tugmasidan kelgan foydalanuvchi obuna bo'lgach, qism darhol yuboriladi
+bot.action(/^chk:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const code = ctx.match[1];
+    const missing = await getMissingChannels(ctx.from.id);
+    if (missing.length > 0) {
+        const buttons = SHOW_CHANNELS.map((ch) => [Markup.button.url(ch.name, ch.url)]);
+        buttons.push([Markup.button.callback("✅ Tekshirish", checkButtonData(code))]);
+        return ctx.reply("❌ Siz hali kanallarga obuna bo'lmagansiz.", Markup.inlineKeyboard(buttons));
+    }
+    await ctx.reply("✅ Ajoyib! Obuna tasdiqlandi 🎉");
+    const opened = await openDeepLink(ctx, code);
+    if (!opened) await ctx.reply("❌ Bu qism topilmadi. «📜 Kino roʻyxati» tugmasidan foydalaning.");
+});
+
+bot.action("check_membership", async (ctx) => {
+    const notSubscribed = await getMissingChannels(ctx.from.id);
 
     if (notSubscribed.length === 0) {
         await ctx.reply("✅ Ajoyib! Siz botdan foydalanishingiz mumkin 🎉");
@@ -953,16 +1185,30 @@ bot.action(/^pay_no:(.+)$/, async (ctx) => {
 
 bot.hears(BTN.VIP_ADMIN, async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.reply("❌ Siz admin emassiz!");
+    const pendingSnap = await db.collection("payments").where("status", "==", "pending").get();
+    const pendingLabel = pendingSnap.size > 0
+        ? `⏳ Kutilayotgan to'lovlar (${pendingSnap.size})`
+        : "⏳ Kutilayotgan to'lovlar";
     await ctx.reply(
         "💎 VIP boshqaruvi",
         Markup.inlineKeyboard([
             [Markup.button.callback("📊 Statistika", "vipadm_stats")],
+            [Markup.button.callback(pendingLabel, "vipadm_pending:0")],
             [Markup.button.callback("📋 Faol VIP'lar", "vipadm_list")],
             [Markup.button.callback("➕ VIP berish", "vipadm_grant")],
             [Markup.button.callback("🗑 VIP olib tashlash", "vipadm_revoke")],
         ])
     );
 });
+
+// To'lov yozuvining summasi (tekin = 0; summa yozilmagan eski yozuvlar narx bo'yicha)
+function paymentAmount(p) {
+    if (p.free === true) return 0;
+    if (p.amount === undefined || p.amount === null || p.amount === "") {
+        return priceForDays(Number(p.days) || VIP_DAYS);
+    }
+    return parseAmount(p.amount);
+}
 
 bot.action("vipadm_stats", async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
@@ -976,14 +1222,26 @@ bot.action("vipadm_stats", async (ctx) => {
     });
 
     const paySnap = await db.collection("payments").get();
-    let pending = 0, approved = 0, rejected = 0, revenue = 0;
+    let pending = 0, approved = 0, rejected = 0, adminGrants = 0, freeGrants = 0;
+    let paidRevenue = 0, adminRevenue = 0;
     paySnap.forEach((d) => {
         const p = d.data();
-        if (p.status === "pending") pending++;
-        else if (p.status === "approved") {
-            approved++;
-            revenue += Number(p.amount) || 0;
-        } else if (p.status === "rejected") rejected++;
+        const status = String(p.status || "").trim().toLowerCase();
+        if (status === "pending") pending++;
+        else if (status === "approved") {
+            const amount = paymentAmount(p);
+            if (p.source === "admin") {
+                if (amount === 0) {
+                    freeGrants++;
+                } else {
+                    adminGrants++;
+                    adminRevenue += amount;
+                }
+            } else {
+                approved++;
+                paidRevenue += amount;
+            }
+        } else if (status === "rejected") rejected++;
     });
 
     await ctx.reply(
@@ -991,11 +1249,71 @@ bot.action("vipadm_stats", async (ctx) => {
         `💎 Faol VIP: <b>${active}</b> ta\n` +
         `👥 Jami VIP bo'lganlar: ${vipSnap.size} ta\n\n` +
         `⏳ Kutilayotgan to'lovlar: ${pending} ta\n` +
-        `✅ Tasdiqlangan: ${approved} ta\n` +
+        `✅ Chek orqali tasdiqlangan: ${approved} ta\n` +
+        `👤 Admin bergan (pullik): ${adminGrants} ta\n` +
+        `🎁 Admin bergan (tekin): ${freeGrants} ta\n` +
         `❌ Rad etilgan: ${rejected} ta\n\n` +
-        `💰 To'lovlar orqali tushum: <b>${formatSum(revenue)} so'm</b>`,
+        `💳 Chek orqali tushum: ${formatSum(paidRevenue)} so'm\n` +
+        `👤 Admin bergan pullik VIP'lar: ${formatSum(adminRevenue)} so'm\n` +
+        `💰 <b>Jami tushum: ${formatSum(paidRevenue + adminRevenue)} so'm</b>`,
         { parse_mode: "HTML" }
     );
+});
+
+// ── Kutilayotgan to'lovlar ro'yxati (chek qayta ko'rsatiladi, tasdiqlash/rad etish mumkin) ──
+const PENDING_PAGE = 5;
+
+bot.action(/^vipadm_pending:(\d+)$/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    await ctx.answerCbQuery();
+    const offset = parseInt(ctx.match[1], 10) || 0;
+
+    const snap = await db.collection("payments").where("status", "==", "pending").get();
+    const list = snap.docs.sort((a, b) => tsToMs(a.data().createdAt) - tsToMs(b.data().createdAt));
+    if (list.length === 0) return ctx.reply("✅ Kutilayotgan to'lovlar yo'q.");
+    if (offset >= list.length) return ctx.reply("✅ Boshqa kutilayotgan to'lov qolmadi.");
+
+    const page = list.slice(offset, offset + PENDING_PAGE);
+    await ctx.reply(`⏳ <b>Kutilayotgan to'lovlar:</b> ${list.length} ta (${offset + 1}–${offset + page.length})`, {
+        parse_mode: "HTML",
+    });
+
+    const staleLimit = Date.now() - PAYMENT_WAIT_HOURS * 60 * 60 * 1000;
+    for (const doc of page) {
+        const p = doc.data();
+        const created = tsToMs(p.createdAt);
+        const name = [p.firstName, p.lastName].filter(Boolean).join(" ") || "Noma'lum";
+        const caption =
+            `💳 <b>VIP to'lov so'rovi</b>${created && created < staleLimit ? " ⚠️ (24 soatdan eski)" : ""}\n\n` +
+            `👤 ${esc(name)}${p.username ? " (@" + esc(p.username) + ")" : ""}\n` +
+            `🆔 <code>${esc(p.userId)}</code>\n` +
+            `💰 ${formatSum(paymentAmount(p))} so'm · ${Number(p.days) || VIP_DAYS} kun\n` +
+            `📅 Yuborilgan: ${created ? fmtDate(created) : "noma'lum"}`;
+        const kb = Markup.inlineKeyboard([
+            [
+                Markup.button.callback("✅ Tasdiqlash", `pay_ok:${doc.id}`),
+                Markup.button.callback("❌ Rad etish", `pay_no:${doc.id}`),
+            ],
+        ]);
+        try {
+            if (p.receiptFileId) {
+                await ctx.replyWithPhoto(p.receiptFileId, { caption, parse_mode: "HTML", ...kb });
+            } else {
+                await ctx.reply(caption + "\n\n⚠️ Chek rasmi topilmadi.", { parse_mode: "HTML", ...kb });
+            }
+        } catch (err) {
+            console.error("Kutilayotgan to'lovni ko'rsatishda xatolik:", err.message);
+            await ctx.reply(caption + "\n\n⚠️ Chek rasmini ko'rsatib bo'lmadi.", { parse_mode: "HTML", ...kb });
+        }
+    }
+
+    const rest = list.length - (offset + page.length);
+    if (rest > 0) {
+        await ctx.reply(
+            `Yana ${rest} ta to'lov bor.`,
+            Markup.inlineKeyboard([[Markup.button.callback("⏭ Keyingilarini ko'rsatish", `vipadm_pending:${offset + PENDING_PAGE}`)]])
+        );
+    }
 });
 
 bot.action("vipadm_list", async (ctx) => {
@@ -1005,20 +1323,22 @@ bot.action("vipadm_list", async (ctx) => {
     const now = Date.now();
     const snap = await db.collection("vips").get();
     const rows = snap.docs
-        .map((d) => d.data())
+        .map((d) => ({ ...d.data(), userId: d.data().userId || d.id }))
         .map((v) => ({ ...v, expiresMs: tsToMs(v.expiresAt) }))
         .filter((v) => v.expiresMs > now)
         .sort((a, b) => a.expiresMs - b.expiresMs);
 
     if (rows.length === 0) return ctx.reply("📭 Hozircha faol VIP foydalanuvchilar yo'q.");
 
-    const LIMIT = 40;
-    let msg = `📋 <b>Faol VIP'lar</b> (${rows.length} ta)\n`;
-    rows.slice(0, LIMIT).forEach((v, i) => {
-        msg += `\n${i + 1}. ${esc(displayName(v))}${v.username ? " (@" + esc(v.username) + ")" : ""} — ${fmtDate(v.expiresMs)} gacha`;
+    // Hammasi ko'rsatiladi: uzun bo'lsa bir nechta xabarga bo'linadi
+    const lines = rows.map((v, i) => {
+        const left = Math.max(1, Math.ceil((v.expiresMs - now) / DAY_MS));
+        return (
+            `${i + 1}. ${esc(displayName(v))}${v.username ? " (@" + esc(v.username) + ")" : ""}\n` +
+            `    🆔 <code>${esc(v.userId)}</code> · ${fmtDate(v.expiresMs)} gacha (${left} kun)`
+        );
     });
-    if (rows.length > LIMIT) msg += `\n\n…va yana ${rows.length - LIMIT} ta`;
-    await ctx.reply(msg, { parse_mode: "HTML" });
+    await sendChunks(ctx, `📋 <b>Faol VIP'lar</b> (${rows.length} ta)\n`, lines);
 });
 
 bot.action("vipadm_grant", async (ctx) => {
@@ -1026,7 +1346,7 @@ bot.action("vipadm_grant", async (ctx) => {
     await ctx.answerCbQuery();
     userStates[ctx.from.id] = "waiting_for_vip_target_grant";
     delete vipAdminTarget[ctx.from.id];
-    await ctx.reply("➕ VIP beriladigan foydalanuvchining @username yoki ID raqamini yuboring (u botdan foydalangan bo'lishi kerak):");
+    await ctx.reply("➕ VIP beriladigan foydalanuvchining ID raqamini yoki @username'ini yuboring:");
 });
 
 bot.action("vipadm_revoke", async (ctx) => {
@@ -1036,19 +1356,43 @@ bot.action("vipadm_revoke", async (ctx) => {
     await ctx.reply("🗑 VIP olib tashlanadigan foydalanuvchining @username yoki ID raqamini yuboring:");
 });
 
-async function completeManualGrant(ctx, days) {
+// Kun soni tanlangach: pullik / tekin / boshqa summa
+async function askVipPayType(ctx, days) {
     const adminId = ctx.from.id;
     const target = vipAdminTarget[adminId];
     if (!target) {
         delete userStates[adminId];
         return ctx.reply("❌ Foydalanuvchi tanlanmagan. «💎 VIP boshqaruvi» orqali qaytadan boshlang.");
     }
+    target.days = days;
+    userStates[adminId] = "waiting_for_vip_paytype";
+    return ctx.reply(
+        `👤 ${displayName(target)} · ${days} kun\n\nBu VIP pullikmi yoki tekin?`,
+        Markup.inlineKeyboard([
+            [Markup.button.callback(`💰 Pullik — ${formatSum(priceForDays(days))} so'm`, "vipp:std")],
+            [Markup.button.callback("✍️ Boshqa summa", "vipp:custom")],
+            [Markup.button.callback("🎁 Tekin (tushumga qo'shilmaydi)", "vipp:free")],
+        ])
+    );
+}
 
-    const expiresMs = await grantVipDays(target, days, "admin");
+async function completeManualGrant(ctx, amount) {
+    const adminId = ctx.from.id;
+    const target = vipAdminTarget[adminId];
+    if (!target || !target.days) {
+        delete userStates[adminId];
+        return ctx.reply("❌ Foydalanuvchi tanlanmagan. «💎 VIP boshqaruvi» orqali qaytadan boshlang.");
+    }
+    const days = target.days;
+
+    const expiresMs = await grantVipDays(target, days, "admin", amount);
     delete userStates[adminId];
     delete vipAdminTarget[adminId];
 
-    await ctx.reply(`✅ ${displayName(target)} ga ${days} kunlik VIP berildi. Muddat: ${fmtDate(expiresMs)} gacha.`);
+    await ctx.reply(
+        `✅ ${displayName(target)} ga ${days} kunlik VIP berildi. Muddat: ${fmtDate(expiresMs)} gacha.\n` +
+        (amount > 0 ? `💰 Tushumga qo'shildi: ${formatSum(amount)} so'm` : "🎁 Tekin (tushumga qo'shilmadi)")
+    );
     try {
         await bot.telegram.sendMessage(
             target.userId,
@@ -1064,9 +1408,26 @@ bot.action(/^vipg:(\d+)$/, async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
     await ctx.answerCbQuery();
     if (userStates[ctx.from.id] !== "waiting_for_vip_days") return;
-    const days = parseInt(ctx.match[1], 10);
+    await askVipPayType(ctx, parseInt(ctx.match[1], 10));
+});
+
+bot.action(/^vipp:(std|free|custom)$/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    const adminId = ctx.from.id;
+    const target = vipAdminTarget[adminId];
+    if (userStates[adminId] !== "waiting_for_vip_paytype" || !target || !target.days) {
+        return ctx.answerCbQuery("Amal muddati o'tgan.");
+    }
+    await ctx.answerCbQuery();
+    await clearInlineButtons(ctx);
+
+    const kind = ctx.match[1];
+    if (kind === "custom") {
+        userStates[adminId] = "waiting_for_vip_amount";
+        return ctx.reply("✍️ Summani so'mda yozing (masalan: 25000). Tekin uchun 0 yozing:");
+    }
     try {
-        await completeManualGrant(ctx, days);
+        await completeManualGrant(ctx, kind === "free" ? 0 : priceForDays(target.days));
     } catch (err) {
         console.error("completeManualGrant xatolik:", err);
         await ctx.reply("❌ Xatolik yuz berdi. Qayta urinib ko'ring.");
@@ -1090,6 +1451,10 @@ bot.on("video", async (ctx) => {
 
     if (state === "waiting_for_film_video") {
         return finalizeFilm(ctx, fileId);
+    }
+
+    if (state === "waiting_for_edit_video") {
+        return applyEditValue(ctx, fileId);
     }
 
     if (state === "waiting_for_adv_media") {
@@ -1183,12 +1548,15 @@ bot.hears(BTN.ADV, async (ctx) => {
     );
 });
 
-bot.hears(BTN.COUNT, async (ctx) => {
+bot.hears([BTN.COUNT, LEGACY_COUNT_BTN], async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.reply("❌ Siz admin emassiz!");
-    const snapshot = await db.collection("users").get();
-    await ctx.reply(`📊 Botda jami *${snapshot.size}* ta foydalanuvchi mavjud.`, {
-        parse_mode: "Markdown",
-    });
+    await showBotStats(ctx);
+});
+
+bot.action("stats_refresh", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    await ctx.answerCbQuery("Yangilandi");
+    await showBotStats(ctx);
 });
 
 bot.hears(BTN.CHANNELS, async (ctx) => {
@@ -1401,8 +1769,14 @@ bot.action("ep_open_all", async (ctx) => {
     if (!tpl) return ctx.answerCbQuery("Amal muddati o'tgan.");
     await ctx.answerCbQuery();
     try {
-        const n = await openAllEpisodes(tpl.dramaId);
-        await ctx.reply(n > 0 ? `🔓 ${n} ta qism hammaga ochildi.` : "ℹ️ VIP uchun yopiq qism qolmagan.");
+        const opened = await openAllEpisodes(tpl.dramaId);
+        invalidateDramaCache();
+        opened.forEach((o) => enqueueNotify(o, "opened"));
+        await ctx.reply(
+            opened.length > 0
+                ? `🔓 ${opened.length} ta qism hammaga ochildi.${NOTIFY_ENABLED ? "\n🔔 Foydalanuvchilarga xabarnoma navbatga qo'yildi." : ""}`
+                : "ℹ️ VIP uchun yopiq qism qolmagan."
+        );
     } catch (err) {
         console.error("openAllEpisodes xatolik:", err);
         await ctx.reply("❌ Xatolik yuz berdi. Qayta urinib ko'ring.");
@@ -1422,55 +1796,966 @@ bot.action("ep_finish", async (ctx) => {
 // KINO RO'YXATI / IZLASH
 // ─────────────────────────────────────────────
 
+const DRAMAS_PER_PAGE = 10;       // ro'yxatning bitta sahifasidagi dramalar
+const EPISODES_PER_PAGE = 30;     // bitta sahifadagi qism tugmalari (Telegram limiti: 100)
+const EP_BUTTONS_PER_ROW = 3;     // bir qatordagi qism tugmalari
+const SEARCH_LIMIT = 20;          // izlashda ko'rsatiladigan dramalar soni
+const DRAMA_CACHE_MS = 2 * 60 * 1000;
+
+let dramaCache = { at: 0, groups: null };
+
+function invalidateDramaCache() {
+    dramaCache = { at: 0, groups: null };
+}
+
+// Izlash/guruhlash uchun matnni soddalashtirish: kichik harf, apostrof va belgilarsiz
+function normalizeText(s) {
+    return String(s || "")
+        .toLowerCase()
+        .replace(/[ʻʼ'’‘`´]/g, "")
+        .replace(/[^\p{L}\p{N}]+/gu, " ")
+        .trim()
+        .replace(/\s+/g, " ");
+}
+
+function dramaKey(title) {
+    return normalizeText(title) || "nomsiz";
+}
+
+function epLabel(e) {
+    return e.episode || (e.epNo ? `${e.epNo}-qism` : "Kino");
+}
+
+function shorten(s, max) {
+    s = String(s || "");
+    return s.length > max ? s.slice(0, max - 1) + "…" : s;
+}
+
+// callback_data limiti: 64 bayt
+function cbFits(data) {
+    return Buffer.byteLength(data, "utf8") <= 64;
+}
+
+// Deep link (t.me/bot?start=...) faqat shu belgilarni qabul qiladi
+function isDeepLinkSafe(s) {
+    return /^[A-Za-z0-9_-]{1,64}$/.test(String(s || ""));
+}
+
+function botUsername(ctx) {
+    return (ctx && ctx.botInfo && ctx.botInfo.username) || (bot.botInfo && bot.botInfo.username) || "";
+}
+
+// Qismlarni drama nomi bo'yicha guruhlaydi (2 daqiqa keshlanadi)
+async function loadDramaGroups(force = false) {
+    if (!force && dramaCache.groups && Date.now() - dramaCache.at < DRAMA_CACHE_MS) {
+        return dramaCache.groups;
+    }
+
+    const snap = await db.collection("films").get();
+    const groups = new Map();
+    const INFO_FIELDS = ["year", "genre", "translator", "language", "description"];
+
+    snap.forEach((doc) => {
+        const d = doc.data();
+        const title = String(d.title || "").trim() || "Nomsiz";
+        const key = dramaKey(title);
+        if (!groups.has(key)) groups.set(key, { title, info: {}, eps: [] });
+        const g = groups.get(key);
+        INFO_FIELDS.forEach((f) => {
+            if (!g.info[f] && d[f]) g.info[f] = String(d[f]);
+        });
+        g.eps.push({
+            code: doc.id,
+            episode: d.episode || "",
+            epNo: typeof d.epNo === "number" ? d.epNo : parseEpNo(d.episode),
+            vipOnly: d.vipOnly === true,
+        });
+    });
+
+    const byCode = (a, b) => a.code.localeCompare(b.code, undefined, { numeric: true });
+    const list = [...groups.values()];
+    list.forEach((g) => {
+        g.eps.sort((a, b) => {
+            const x = a.epNo === null ? Infinity : a.epNo;
+            const y = b.epNo === null ? Infinity : b.epNo;
+            return (x === y ? 0 : x - y) || byCode(a, b);
+        });
+        // Barqaror kalit: dramaning eng kichik kodi
+        g.key = [...g.eps].sort(byCode)[0].code;
+    });
+    list.sort((a, b) => a.title.localeCompare(b.title, undefined, { sensitivity: "base", numeric: true }));
+
+    dramaCache = { at: Date.now(), groups: list };
+    return list;
+}
+
+function findGroupByCode(groups, code) {
+    return groups.find((g) => g.eps.some((e) => e.code === code)) || null;
+}
+
+function epPageOf(group, code) {
+    const idx = group.eps.findIndex((e) => e.code === code);
+    return idx < 0 ? 0 : Math.floor(idx / EPISODES_PER_PAGE);
+}
+
+function dramaCallback(groups, group, epPage) {
+    const data = `dr:${group.key}:${epPage}`;
+    return cbFits(data) ? data : `dri:${groups.indexOf(group)}:${epPage}`;
+}
+
+// Callback orqali kelsa xabarni tahrirlaydi, aks holda (yoki video xabar bo'lsa) yangi xabar yuboradi
+async function showOrEdit(ctx, text, keyboard) {
+    const extra = { parse_mode: "HTML", ...Markup.inlineKeyboard(keyboard) };
+    if (ctx.callbackQuery && ctx.callbackQuery.message && ctx.callbackQuery.message.text) {
+        try {
+            return await ctx.editMessageText(text, extra);
+        } catch (err) {
+            const msg = String((err.response && err.response.description) || err.message);
+            if (msg.includes("message is not modified")) return;
+        }
+    }
+    return ctx.reply(text, extra);
+}
+
+async function showDramaPage(ctx, page) {
+    const groups = await loadDramaGroups();
+    if (groups.length === 0) return ctx.reply("❌ Hozircha bazaga hech qanday drama qo'shilmagan.");
+
+    const pages = Math.ceil(groups.length / DRAMAS_PER_PAGE);
+    page = Math.min(Math.max(0, page || 0), pages - 1);
+    const start = page * DRAMAS_PER_PAGE;
+
+    const keyboard = groups.slice(start, start + DRAMAS_PER_PAGE).map((g) => {
+        let label = `🎬 ${shorten(g.title, 50)}`;
+        if (g.eps.some((e) => e.vipOnly)) label += " 💎";
+        return [Markup.button.callback(label, dramaCallback(groups, g, 0))];
+    });
+
+    if (pages > 1) {
+        const nav = [];
+        if (page > 0) nav.push(Markup.button.callback("⬅️", `drpg:${page - 1}`));
+        nav.push(Markup.button.callback(`${page + 1} / ${pages}`, "drpg_noop"));
+        if (page < pages - 1) nav.push(Markup.button.callback("➡️", `drpg:${page + 1}`));
+        keyboard.push(nav);
+    }
+
+    let text = `🎬 <b>SeoulFlix Drama Ro'yxati</b>\n\n📚 Jami: ${groups.length} ta drama`;
+    if (groups.some((g) => g.eps.some((e) => e.vipOnly))) text += "\n💎 — VIP uchun yangi qismlari bor";
+    text += "\n\nKerakli dramani tanlang 👇";
+    return showOrEdit(ctx, text, keyboard);
+}
+
+async function showDramaEpisodes(ctx, groups, group, epPage) {
+    const total = group.eps.length;
+    const pages = Math.max(1, Math.ceil(total / EPISODES_PER_PAGE));
+    epPage = Math.min(Math.max(0, epPage || 0), pages - 1);
+    const slice = group.eps.slice(epPage * EPISODES_PER_PAGE, (epPage + 1) * EPISODES_PER_PAGE);
+
+    let text = `🎬 <b>${esc(group.title)}</b>\n`;
+    const meta = [];
+    if (group.info.year) meta.push(`🗓 ${esc(group.info.year)}`);
+    if (group.info.genre) meta.push(`📄 ${esc(group.info.genre)}`);
+    if (group.info.language) meta.push(`🌐 ${esc(group.info.language)}`);
+    if (group.info.translator) meta.push(`🎧 ${esc(group.info.translator)}`);
+    if (meta.length) text += meta.join(" · ") + "\n";
+    if (group.info.description) text += `\n📕 ${esc(shorten(group.info.description, 350))}\n`;
+    text += `\n📺 Qismlar: <b>${total}</b> ta`;
+    if (pages > 1) text += ` (${epPage + 1}/${pages}-sahifa)`;
+    if (group.eps.some((e) => e.vipOnly)) text += "\n💎 — hozircha faqat VIP uchun";
+    text += "\n\nKo'rmoqchi bo'lgan qismni tanlang 👇";
+
+    const keyboard = [];
+    let row = [];
+    const leftovers = [];
+    for (const e of slice) {
+        const data = `ep:${e.code}`;
+        if (!cbFits(data)) {
+            leftovers.push(e);
+            continue;
+        }
+        row.push(Markup.button.callback(`${e.vipOnly ? "💎" : "▶️"} ${shorten(epLabel(e), 25)}`, data));
+        if (row.length === EP_BUTTONS_PER_ROW) {
+            keyboard.push(row);
+            row = [];
+        }
+    }
+    if (row.length) keyboard.push(row);
+
+    // Juda uzun kodli qismlar tugmaga sig'maydi: kodini matnda ko'rsatamiz
+    if (leftovers.length) {
+        text += "\n";
+        leftovers.forEach((e) => {
+            text += `\n🎞 ${esc(epLabel(e))} — Kod: <code>${esc(e.code)}</code>`;
+        });
+    }
+
+    if (pages > 1) {
+        const nav = [];
+        if (epPage > 0) nav.push(Markup.button.callback("⬅️ Oldingi", dramaCallback(groups, group, epPage - 1)));
+        nav.push(Markup.button.callback(`${epPage + 1} / ${pages}`, "drpg_noop"));
+        if (epPage < pages - 1) nav.push(Markup.button.callback("Keyingi ➡️", dramaCallback(groups, group, epPage + 1)));
+        keyboard.push(nav);
+    }
+
+    const listPage = Math.max(0, Math.floor(groups.indexOf(group) / DRAMAS_PER_PAGE));
+    keyboard.push([Markup.button.callback("⬅️ Ortga", `drpg:${listPage}`)]);
+
+    return showOrEdit(ctx, text, keyboard);
+}
+
+// Nomi bo'yicha izlash: so'rovdagi barcha so'zlar drama nomida bo'lishi kerak
+function searchDramas(groups, query) {
+    const q = normalizeText(query);
+    if (q.length < 2) return [];
+    const tokens = q.split(" ");
+    return groups
+        .map((g) => ({ g, t: dramaKey(g.title) }))
+        .filter(({ t }) => tokens.every((tok) => t.includes(tok)))
+        .sort((a, b) => {
+            const rank = (t) => (t === q ? 0 : t.startsWith(q) ? 1 : t.includes(q) ? 2 : 3);
+            return rank(a.t) - rank(b.t) || a.g.title.localeCompare(b.g.title);
+        })
+        .map(({ g }) => g);
+}
+
+async function showSearchResults(ctx, groups, matches, query) {
+    if (matches.length === 1) return showDramaEpisodes(ctx, groups, matches[0], 0);
+
+    const shown = matches.slice(0, SEARCH_LIMIT);
+    const keyboard = shown.map((g) => {
+        let label = `🎬 ${shorten(g.title, 50)}`;
+        if (g.eps.some((e) => e.vipOnly)) label += " 💎";
+        return [Markup.button.callback(label, dramaCallback(groups, g, 0))];
+    });
+    let text = `🔎 «${esc(shorten(query, 50))}» bo'yicha <b>${matches.length}</b> ta drama topildi:`;
+    if (matches.length > SEARCH_LIMIT) text += `\n\nℹ️ Birinchi ${SEARCH_LIMIT} tasi ko'rsatildi. Aniqroq yozing.`;
+    return ctx.reply(text, { parse_mode: "HTML", ...Markup.inlineKeyboard(keyboard) });
+}
+
+// Qismni yuborish (kod, tugma, navigatsiya va havola uchun yagona funksiya).
+// Kod bo'yicha qism topilmasa false qaytaradi.
+async function sendEpisode(ctx, code) {
+    const userId = ctx.from.id;
+    if (!isValidCode(code)) return false;
+    const filmDoc = await db.collection("films").doc(code).get();
+    if (!filmDoc.exists) return false;
+    const film = filmDoc.data();
+
+    let groups = await loadDramaGroups();
+    let group = findGroupByCode(groups, code);
+    if (!group) {
+        // yangi qo'shilgan qism keshda bo'lmasligi mumkin
+        groups = await loadDramaGroups(true);
+        group = findGroupByCode(groups, code);
+    }
+    const allBtn = group
+        ? Markup.button.callback("📜 Barcha qismlar", dramaCallback(groups, group, epPageOf(group, code)))
+        : null;
+
+    // VIP uchun yopiq qism
+    if (film.vipOnly === true && !(await hasVipAccess(userId))) {
+        const kb = [[Markup.button.callback("💎 VIP haqida", "vip_info")]];
+        if (allBtn) kb.push([allBtn]);
+        await ctx.reply(
+            `🔒 <b>${esc(film.title || "Drama")}</b>${film.episode ? " · " + esc(film.episode) : ""}\n\n` +
+            `Bu qism hozircha <b>faqat VIP</b> foydalanuvchilar uchun.\n` +
+            `⏳ Oddiy foydalanuvchilar uchun u keyinroq ochiladi.\n\n` +
+            `💎 VIP bilan yangi qismlarni ${VIP_AHEAD} qism oldin va reklamasiz ko'ring!`,
+            { parse_mode: "HTML", ...Markup.inlineKeyboard(kb) }
+        );
+        return true;
+    }
+
+    // Video ostidagi tugmalar: oldingi / keyingi qism, barcha qismlar, ulashish
+    const keyboard = [];
+    if (group) {
+        const i = group.eps.findIndex((e) => e.code === code);
+        const prev = i > 0 ? group.eps[i - 1] : null;
+        const next = i >= 0 && i < group.eps.length - 1 ? group.eps[i + 1] : null;
+        const nav = [];
+        if (prev && cbFits(`ep:${prev.code}`)) {
+            nav.push(Markup.button.callback(`⬅️ ${prev.vipOnly ? "💎 " : ""}${shorten(epLabel(prev), 20)}`, `ep:${prev.code}`));
+        }
+        if (next && cbFits(`ep:${next.code}`)) {
+            nav.push(Markup.button.callback(`${next.vipOnly ? "💎 " : ""}${shorten(epLabel(next), 20)} ➡️`, `ep:${next.code}`));
+        }
+        if (nav.length) keyboard.push(nav);
+        keyboard.push([allBtn]);
+    }
+    const uname = botUsername(ctx);
+    if (uname && isDeepLinkSafe(code)) {
+        const link = `https://t.me/${uname}?start=${code}`;
+        const shareText = [film.title, film.episode].filter(Boolean).join(" · ");
+        keyboard.push([
+            Markup.button.url(
+                "📤 Do'stlarga ulashish",
+                `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(shareText)}`
+            ),
+        ]);
+    }
+
+    try {
+        await incrementViewCount(code);
+        const updatedViews = (film.views || 0) + 1;
+        const requesterUsername = (ctx.from.username || "").toLowerCase();
+        const canDownload = DOWNLOAD_USERNAMES.has(requesterUsername);
+
+        await ctx.replyWithVideo(film.video_link, {
+            caption: buildCaption(film, updatedViews),
+            parse_mode: "HTML",
+            protect_content: !canDownload,
+            ...(keyboard.length ? Markup.inlineKeyboard(keyboard) : {}),
+        });
+
+        // Admin uchun: kanal postiga qo'yish uchun tayyor havolalar
+        if (userId === ADMIN_ID && uname && isDeepLinkSafe(code)) {
+            let links = `🔗 Qism havolasi:\n<code>https://t.me/${uname}?start=${esc(code)}</code>`;
+            if (group && isDeepLinkSafe(`dr_${group.key}`)) {
+                links += `\n\n📜 Barcha qismlar havolasi:\n<code>https://t.me/${uname}?start=dr_${esc(group.key)}</code>`;
+            }
+            await ctx.reply(links, {
+                parse_mode: "HTML",
+                ...(cbFits(`edm:${code}`)
+                    ? Markup.inlineKeyboard([[Markup.button.callback("✏️ Tahrirlash / o'chirish", `edm:${code}`)]])
+                    : {}),
+            });
+        }
+    } catch (err) {
+        console.error("Video yuborishda xatolik:", err.message);
+        await ctx.reply("❌ Video yuborishda xatolik yuz berdi.");
+    }
+    return true;
+}
+
+// Havola orqali kelganda: "0012" -> qism, "dr_0012" -> dramaning barcha qismlari
+async function openDeepLink(ctx, payload) {
+    if (await sendEpisode(ctx, payload)) return true;
+    if (payload.startsWith("dr_")) {
+        const groups = await loadDramaGroups(true);
+        const group = findGroupByCode(groups, payload.slice(3));
+        if (group) {
+            await showDramaEpisodes(ctx, groups, group, 0);
+            return true;
+        }
+    }
+    return false;
+}
+
 bot.hears(BTN.LIST, async (ctx) => {
     const subscribed = await checkSubscription(ctx);
     if (!subscribed) return;
+    await showDramaPage(ctx, 0);
+});
 
-    const snapshot = await db.collection("films").get();
-    if (snapshot.empty) return ctx.reply("❌ Hozircha bazaga hech qanday drama qo'shilmagan.");
+bot.action(/^drpg:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    await showDramaPage(ctx, parseInt(ctx.match[1], 10));
+});
 
-    // Kino kodi bo'yicha raqamli tartib (1, 2, 10)
-    const films = snapshot.docs
-        .map((doc) => {
-            const d = doc.data();
-            return {
-                code: doc.id,
-                title: d.title || "Nomsiz",
-                episode: d.episode || "",
-                vipOnly: d.vipOnly === true,
-            };
-        })
-        .sort((a, b) => a.code.localeCompare(b.code, undefined, { numeric: true }));
+bot.action("drpg_noop", (ctx) => ctx.answerCbQuery());
 
-    let header = "🎬 <b>SeoulFlix Drama Ro'yxati</b>";
-    if (films.some((f) => f.vipOnly)) header += "\n💎 — hozircha faqat VIP uchun";
-
-    const chunks = [];
-    let current = header + "\n";
-    for (const f of films) {
-        const line =
-            `🎬 <b>${esc(f.title)}</b>${f.episode ? " · " + esc(f.episode) : ""}${f.vipOnly ? " 💎" : ""}` +
-            ` — Kod: <code>${esc(f.code)}</code>`;
-        // Telegram xabar limiti 4096 belgi
-        if (current.length + line.length + 1 > 3800) {
-            chunks.push(current);
-            current = line;
-        } else {
-            current += "\n" + line;
-        }
+async function openGroupFromCallback(ctx, finder, epPage) {
+    const groups = await loadDramaGroups();
+    const group = finder(groups);
+    if (!group) {
+        await ctx.answerCbQuery("❌ Drama topilmadi.");
+        return showDramaPage(ctx, 0);
     }
-    chunks.push(current);
+    await ctx.answerCbQuery();
+    return showDramaEpisodes(ctx, groups, group, epPage);
+}
 
-    for (const chunk of chunks) {
-        await ctx.reply(chunk, { parse_mode: "HTML" });
-    }
+bot.action(/^dr:(.+):(\d+)$/, (ctx) => {
+    const code = ctx.match[1];
+    return openGroupFromCallback(ctx, (groups) => findGroupByCode(groups, code), parseInt(ctx.match[2], 10));
+});
+
+bot.action(/^dri:(\d+):(\d+)$/, (ctx) => {
+    const idx = parseInt(ctx.match[1], 10);
+    return openGroupFromCallback(ctx, (groups) => groups[idx] || null, parseInt(ctx.match[2], 10));
+});
+
+// Qism tugmasi yoki video ostidagi oldingi/keyingi tugmasi
+bot.action(/^ep:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const subscribed = await checkSubscription(ctx, ctx.match[1]);
+    if (!subscribed) return;
+    const sent = await sendEpisode(ctx, ctx.match[1]);
+    if (!sent) await ctx.reply("❌ Bu qism topilmadi (o'chirilgan bo'lishi mumkin).");
 });
 
 bot.hears(BTN.SEARCH, async (ctx) => {
     const subscribed = await checkSubscription(ctx);
     if (!subscribed) return;
-    ctx.reply("🔎 Drama kodini yuboring yoki nomini yozing 👇");
+    ctx.reply("🔎 Drama kodini yoki nomini yozing 👇\n\nMasalan: <code>0001</code> yoki drama nomining bir qismi.", { parse_mode: "HTML" });
 });
+
+// ─────────────────────────────────────────────
+// YANGI QISM XABARNOMALARI (foydalanuvchilarga avtomatik)
+// ─────────────────────────────────────────────
+
+// dramaKey -> { title, all: Map, vip: Map, opened: Map, timer }
+//   all    — hamma uchun yangi qism (hammaga yuboriladi)
+//   vip    — faqat VIP uchun yangi qism (faqat faol VIP'larga)
+//   opened — VIP'dan hammaga ochilgan qism (VIP bo'lmaganlarga)
+const notifyQueue = new Map();
+let broadcastChain = Promise.resolve(); // xabarnomalar ketma-ket yuboriladi (Telegram limiti uchun)
+
+function epSort(a, b) {
+    const x = typeof a.epNo === "number" ? a.epNo : Infinity;
+    const y = typeof b.epNo === "number" ? b.epNo : Infinity;
+    return (x === y ? 0 : x - y) || String(a.code).localeCompare(String(b.code), undefined, { numeric: true });
+}
+
+function findQueueKeyByCode(code) {
+    for (const [key, e] of notifyQueue) {
+        if (e.all.has(code) || e.vip.has(code) || e.opened.has(code)) return key;
+    }
+    return null;
+}
+
+function enqueueNotify(ep, kind) {
+    if (!NOTIFY_ENABLED || !ep || !ep.code) return;
+    const key = dramaKey(ep.title);
+    let entry = notifyQueue.get(key);
+    if (!entry) {
+        entry = { title: ep.title || "Nomsiz", all: new Map(), vip: new Map(), opened: new Map(), timer: null };
+        notifyQueue.set(key, entry);
+    }
+
+    if (kind === "opened" && (entry.vip.has(ep.code) || entry.all.has(ep.code))) {
+        // hali xabar berilmagan VIP qism hammaga ochildi: hamma uchun yangi qism sifatida yuboriladi
+        entry.vip.delete(ep.code);
+        entry.all.set(ep.code, ep);
+    } else {
+        entry.all.delete(ep.code);
+        entry.vip.delete(ep.code);
+        entry.opened.delete(ep.code);
+        entry[kind].set(ep.code, ep);
+    }
+
+    clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => flushNotify(key), NOTIFY_DELAY_MIN * 60 * 1000);
+}
+
+function removeFromNotify(code) {
+    const key = findQueueKeyByCode(code);
+    if (!key) return;
+    const e = notifyQueue.get(key);
+    e.all.delete(code);
+    e.vip.delete(code);
+    e.opened.delete(code);
+    if (e.all.size + e.vip.size + e.opened.size === 0) {
+        clearTimeout(e.timer);
+        notifyQueue.delete(key);
+    }
+}
+
+function flushNotify(key) {
+    const entry = notifyQueue.get(key);
+    if (!entry) return false;
+    clearTimeout(entry.timer);
+    notifyQueue.delete(key);
+    broadcastChain = broadcastChain
+        .then(() => runNotify(entry))
+        .catch((err) => console.error("Xabarnoma xatolik:", err));
+    return true;
+}
+
+async function sendWithRetry(fn) {
+    try {
+        return await fn();
+    } catch (error) {
+        if (error.response && error.response.error_code === 429) {
+            const wait = ((error.response.parameters && error.response.parameters.retry_after) || 1) + 1;
+            await sleep(wait * 1000);
+            return fn();
+        }
+        throw error;
+    }
+}
+
+function buildNotifyMessage(groups, group, isNewDrama, newEps, openedEps, forVip) {
+    const label = (e) => `${epLabel(e)}${e.vipOnly ? " 💎" : ""}`;
+    let header;
+    if (isNewDrama) header = "🆕 <b>Yangi drama qo'shildi!</b>";
+    else if (newEps.length > 1) header = "🔔 <b>Yangi qismlar qo'shildi!</b>";
+    else if (newEps.length === 1) header = "🔔 <b>Yangi qism qo'shildi!</b>";
+    else header = "🔓 <b>Yangi qism hamma uchun ochildi!</b>";
+
+    let text = `${header}\n\n🎬 <b>${esc(group.title)}</b>`;
+    if (isNewDrama) {
+        const meta = [];
+        if (group.info.year) meta.push(`🗓 ${esc(group.info.year)}`);
+        if (group.info.genre) meta.push(`📄 ${esc(group.info.genre)}`);
+        if (meta.length) text += `\n${meta.join(" · ")}`;
+    }
+    if (newEps.length) text += `\n🎞 ${newEps.map((e) => esc(label(e))).join(", ")}`;
+    if (openedEps.length) text += `\n🔓 Endi hamma uchun ochiq: ${openedEps.map((e) => esc(epLabel(e))).join(", ")}`;
+    if (forVip && newEps.some((e) => e.vipOnly)) text += `\n\n💎 VIP sifatida siz uni boshqalardan oldin ko'rasiz!`;
+    text += "\n\nHoziroq tomosha qiling 👇";
+
+    const first = [...newEps, ...openedEps].sort(epSort)[0];
+    const kb = [];
+    if (first && cbFits(`ep:${first.code}`)) {
+        kb.push([Markup.button.callback(`▶️ Ko'rish: ${shorten(epLabel(first), 25)}`, `ep:${first.code}`)]);
+    }
+    kb.push([Markup.button.callback("📜 Barcha qismlar", dramaCallback(groups, group, 0))]);
+    kb.push([Markup.button.callback("🔕 Xabarnomalarni o'chirish", "notif_off")]);
+    return { text, extra: { parse_mode: "HTML", ...Markup.inlineKeyboard(kb) } };
+}
+
+async function runNotify(entry) {
+    const groups = await loadDramaGroups(true);
+    const codes = [...entry.all.keys(), ...entry.vip.keys(), ...entry.opened.keys()];
+    const group = groups.find((g) => g.eps.some((e) => codes.includes(e.code)));
+    if (!group) return;
+
+    // O'chirilgan qismlarni tashlab, joriy holat bo'yicha olamiz
+    const byCode = new Map(group.eps.map((e) => [e.code, e]));
+    const pick = (m) => [...m.keys()].filter((c) => byCode.has(c)).map((c) => byCode.get(c)).sort(epSort);
+    const allEps = pick(entry.all);
+    const vipEps = pick(entry.vip);
+    const openedEps = pick(entry.opened);
+    if (allEps.length + vipEps.length + openedEps.length === 0) return;
+
+    const newCodes = new Set([...allEps, ...vipEps].map((e) => e.code));
+    const isNewDrama = newCodes.size > 0 && group.eps.every((e) => newCodes.has(e.code));
+
+    const vipNew = [...allEps, ...vipEps].sort(epSort);
+    const vipMsg = vipNew.length ? buildNotifyMessage(groups, group, isNewDrama, vipNew, [], true) : null;
+    const userMsg =
+        allEps.length || openedEps.length
+            ? buildNotifyMessage(groups, group, isNewDrama && allEps.length > 0, allEps, openedEps, false)
+            : null;
+
+    const [usersSnap, vipIds] = await Promise.all([db.collection("users").get(), getActiveVipIds()]);
+    let success = 0, failed = 0, muted = 0;
+
+    for (const docSnap of usersSnap.docs) {
+        const u = docSnap.data();
+        const uid = Number(u.userId || docSnap.id);
+        if (!uid || uid === ADMIN_ID) continue;
+        if (u.notifyOff === true) {
+            muted++;
+            continue;
+        }
+        const msg = vipIds.has(String(uid)) ? vipMsg : userMsg;
+        if (!msg) continue;
+
+        try {
+            await sendWithRetry(() => bot.telegram.sendMessage(uid, msg.text, msg.extra));
+            success++;
+        } catch (error) {
+            if (error.response && error.response.error_code === 403) {
+                await docSnap.ref.delete().catch(() => { });
+            }
+            failed++;
+        }
+        await sleep(40);
+    }
+
+    const list = [...vipNew, ...openedEps].sort(epSort).map((e) => epLabel(e)).join(", ");
+    await bot.telegram
+        .sendMessage(
+            ADMIN_ID,
+            `🔔 <b>Xabarnoma yuborildi</b>\n\n🎬 ${esc(group.title)}\n🎞 ${esc(list)}\n\n` +
+            `🟢 Yuborildi: ${success} ta\n🔴 Xatolik: ${failed} ta\n🔕 O'chirib qo'yganlar: ${muted} ta`,
+            { parse_mode: "HTML" }
+        )
+        .catch(() => { });
+}
+
+bot.action(/^ntf_now:(.+)$/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    const key = findQueueKeyByCode(ctx.match[1]);
+    if (!key) return ctx.answerCbQuery("ℹ️ Bu xabarnoma allaqachon yuborilgan yoki bekor qilingan.", { show_alert: true });
+    flushNotify(key);
+    await ctx.answerCbQuery("📣 Yuborilmoqda...");
+    await ctx.reply("📣 Xabarnoma yuborilmoqda. Tugagach hisobot keladi.");
+});
+
+bot.action(/^ntf_cancel:(.+)$/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    const key = findQueueKeyByCode(ctx.match[1]);
+    if (!key) return ctx.answerCbQuery("ℹ️ Bu xabarnoma allaqachon yuborilgan yoki bekor qilingan.", { show_alert: true });
+    const e = notifyQueue.get(key);
+    clearTimeout(e.timer);
+    notifyQueue.delete(key);
+    await ctx.answerCbQuery("🔕 Bekor qilindi");
+    await ctx.reply(`🔕 «${e.title}» bo'yicha xabarnoma bu safar yuborilmaydi.`);
+});
+
+// Foydalanuvchi: xabarnomalarni o'chirish / yoqish
+bot.action("notif_off", async (ctx) => {
+    await db.collection("users").doc(String(ctx.from.id)).set({ notifyOff: true }, { merge: true });
+    await ctx.answerCbQuery("🔕 O'chirildi");
+    await ctx.reply(
+        "🔕 Yangi qismlar haqidagi xabarnomalar o'chirildi.",
+        Markup.inlineKeyboard([[Markup.button.callback("🔔 Qayta yoqish", "notif_on")]])
+    );
+});
+
+bot.action("notif_on", async (ctx) => {
+    await db.collection("users").doc(String(ctx.from.id)).set({ notifyOff: false }, { merge: true });
+    await ctx.answerCbQuery("🔔 Yoqildi");
+    await clearInlineButtons(ctx);
+    await ctx.reply("🔔 Xabarnomalar yoqildi! Yangi qismlar chiqqanda sizga xabar beramiz.");
+});
+
+// ─────────────────────────────────────────────
+// ADMIN: QISMNI TAHRIRLASH / O'CHIRISH
+// ─────────────────────────────────────────────
+
+const EDIT_FIELDS = {
+    t: { key: "title", label: "🎬 Nomi" },
+    e: { key: "episode", label: "🎞 Qism" },
+    y: { key: "year", label: "🗓 Yil" },
+    tr: { key: "translator", label: "🎧 Tarjimon" },
+    l: { key: "language", label: "🌐 Til" },
+    g: { key: "genre", label: "📄 Janr" },
+    d: { key: "description", label: "📕 Tavsif" },
+    v: { key: "video_link", label: "🎥 Video" },
+};
+
+async function showEditMenu(ctx, code) {
+    const doc = await db.collection("films").doc(code).get();
+    if (!doc.exists) return ctx.reply("❌ Bu qism topilmadi (o'chirilgan bo'lishi mumkin).");
+    if (!cbFits(`eddelok:${code}`)) {
+        return ctx.reply("❌ Bu qism kodi juda uzun, tugmalar orqali tahrirlab bo'lmaydi.");
+    }
+    const f = doc.data();
+    const groups = await loadDramaGroups();
+    const group = findGroupByCode(groups, code);
+    const val = (v) => (v ? esc(shorten(v, 200)) : "<i>kiritilmagan</i>");
+
+    const text =
+        `✏️ <b>Qismni tahrirlash</b>\n\n` +
+        `🔑 Kod: <code>${esc(code)}</code>\n` +
+        `🎬 Nomi: ${val(f.title)}${group ? ` (dramada ${group.eps.length} ta qism)` : ""}\n` +
+        `🎞 Qism: ${val(f.episode)}\n` +
+        `🗓 Yil: ${val(f.year)}\n` +
+        `🎧 Tarjimon: ${val(f.translator)}\n` +
+        `🌐 Til: ${val(f.language)}\n` +
+        `📄 Janr: ${val(f.genre)}\n` +
+        `📕 Tavsif: ${val(f.description)}\n` +
+        `👥 Kimga: ${f.vipOnly === true ? "💎 Faqat VIP" : "🌍 Hamma"}\n` +
+        `👁 Ko'rilgan: ${f.views || 0} marta\n\n` +
+        `O'zgartirmoqchi bo'lgan maydonni tanlang 👇`;
+
+    const b = (k) => Markup.button.callback(EDIT_FIELDS[k].label, `ed:${k}:${code}`);
+    const keyboard = [
+        [b("t"), b("e")],
+        [b("y"), b("tr")],
+        [b("l"), b("g")],
+        [b("d"), b("v")],
+        [
+            Markup.button.callback(
+                f.vipOnly === true ? "🌍 Hamma uchun ochish" : "💎 Faqat VIP qilish",
+                `edvip:${code}`
+            ),
+        ],
+        [Markup.button.callback("▶️ Ko'rish", `ep:${code}`), Markup.button.callback("🗑 O'chirish", `eddel:${code}`)],
+        [Markup.button.callback("✖️ Yopish", "edclose")],
+    ];
+    return showOrEdit(ctx, text, keyboard);
+}
+
+bot.hears(BTN.EDIT_EP, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.reply("❌ Siz admin emassiz!");
+    delete editTarget[ctx.from.id];
+    userStates[ctx.from.id] = "waiting_for_edit_code";
+    await ctx.reply(
+        "✏️ Tahrirlamoqchi yoki o'chirmoqchi bo'lgan qism kodini yuboring:\n\n" +
+        "💡 Istalgan qism kodini yuborganingizda video ostida «✏️ Tahrirlash» tugmasi ham chiqadi.",
+        Markup.inlineKeyboard([[Markup.button.callback("❌ Bekor qilish", "edcancel")]])
+    );
+});
+
+bot.action(/^edm:(.+)$/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    await ctx.answerCbQuery();
+    delete userStates[ctx.from.id];
+    delete editTarget[ctx.from.id];
+    await showEditMenu(ctx, ctx.match[1]);
+});
+
+bot.action(/^ed:(t|e|y|tr|l|g|d|v):(.+)$/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    await ctx.answerCbQuery();
+    const field = ctx.match[1];
+    const code = ctx.match[2];
+    const doc = await db.collection("films").doc(code).get();
+    if (!doc.exists) return ctx.reply("❌ Bu qism topilmadi.");
+    const f = doc.data();
+
+    editTarget[ctx.from.id] = { code, field };
+    userStates[ctx.from.id] = field === "v" ? "waiting_for_edit_video" : "waiting_for_edit_value";
+
+    const current = f[EDIT_FIELDS[field].key];
+    let prompt;
+    if (field === "t") {
+        const groups = await loadDramaGroups();
+        const group = findGroupByCode(groups, code);
+        const n = group ? group.eps.length : 1;
+        prompt = `🎬 Yangi nomni yuboring.\n\n⚠️ Butun dramaning nomi o'zgaradi (${n} ta qism).`;
+    } else if (field === "e") {
+        prompt = "🎞 Yangi qism raqamini yuboring (masalan: 5 yoki 5-qism).";
+    } else if (field === "v") {
+        prompt = "🎥 Yangi videoni video fayl sifatida yuboring.";
+    } else {
+        prompt = `${EDIT_FIELDS[field].label} uchun yangi qiymatni yuboring.\n\nMaydonni tozalash uchun «-» yuboring.`;
+    }
+    if (field !== "v") prompt += `\n\nHozirgi: ${current ? esc(shorten(current, 500)) : "<i>kiritilmagan</i>"}`;
+
+    await ctx.reply(prompt, {
+        parse_mode: "HTML",
+        ...Markup.inlineKeyboard([[Markup.button.callback("❌ Bekor qilish", `edm:${code}`)]]),
+    });
+});
+
+async function applyEditValue(ctx, value) {
+    const adminId = ctx.from.id;
+    const t = editTarget[adminId];
+    if (!t) {
+        delete userStates[adminId];
+        return ctx.reply("❌ Seans tugagan. «✏️ Qismni tahrirlash» orqali qaytadan boshlang.");
+    }
+    const ref = db.collection("films").doc(t.code);
+    const snap = await ref.get();
+    if (!snap.exists) {
+        delete userStates[adminId];
+        delete editTarget[adminId];
+        return ctx.reply("❌ Bu qism topilmadi (o'chirilgan bo'lishi mumkin).");
+    }
+    const field = EDIT_FIELDS[t.field];
+    let note = "";
+
+    try {
+        if (t.field === "t") {
+            const title = String(value).trim();
+            if (!title || title === "-") return ctx.reply("❌ Nom bo'sh bo'lishi mumkin emas. Qayta yuboring:");
+            if (title.length > 200) return ctx.reply("❌ Nom juda uzun (200 belgigacha). Qayta yuboring:");
+            const groups = await loadDramaGroups(true);
+            const group = findGroupByCode(groups, t.code);
+            const codes = group ? group.eps.map((e) => e.code) : [t.code];
+            for (let i = 0; i < codes.length; i += 400) {
+                const batch = db.batch();
+                codes.slice(i, i + 400).forEach((c) => batch.update(db.collection("films").doc(c), { title }));
+                await batch.commit();
+            }
+            note = ` (${codes.length} ta qismda)`;
+        } else if (t.field === "e") {
+            const label = normalizeEpisode(value);
+            const epNo = parseEpNo(label);
+            if (epNo === null) return ctx.reply("❌ Qism raqami bo'lishi kerak (masalan: 5). Qayta yuboring:");
+            const groups = await loadDramaGroups(true);
+            const group = findGroupByCode(groups, t.code);
+            const dup = group && group.eps.find((e) => e.code !== t.code && e.epNo === epNo);
+            if (dup) return ctx.reply(`❌ ${epNo}-qism allaqachon bor (kod: ${dup.code}). Boshqa raqam yuboring:`);
+            await ref.update({ episode: label, epNo });
+        } else if (t.field === "v") {
+            await ref.update({ video_link: value });
+        } else {
+            let v = String(value).trim();
+            if (v === "-") v = "";
+            if (t.field === "d" && v.length > 3000) v = v.slice(0, 3000);
+            if (t.field !== "d" && v.length > 200) v = v.slice(0, 200);
+            await ref.update({ [field.key]: v });
+        }
+    } catch (err) {
+        console.error("Tahrirlashda xatolik:", err);
+        return ctx.reply("❌ Saqlashda xatolik yuz berdi. Qayta urinib ko'ring.");
+    }
+
+    invalidateDramaCache();
+    delete userStates[adminId];
+    delete editTarget[adminId];
+    await ctx.reply(`✅ ${field.label} saqlandi${note}.`);
+    return showEditMenu(ctx, t.code);
+}
+
+bot.action(/^edvip:(.+)$/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    const code = ctx.match[1];
+    const ref = db.collection("films").doc(code);
+    const snap = await ref.get();
+    if (!snap.exists) return ctx.answerCbQuery("❌ Qism topilmadi.");
+    const f = snap.data();
+    const makeVip = f.vipOnly !== true;
+
+    await ref.update(
+        makeVip ? { vipOnly: true } : { vipOnly: false, openedAt: admin.firestore.Timestamp.now() }
+    );
+    invalidateDramaCache();
+    if (!makeVip) enqueueNotify({ code, episode: f.episode, epNo: f.epNo, title: f.title }, "opened");
+
+    await ctx.answerCbQuery(
+        makeVip
+            ? "💎 Endi faqat VIP uchun"
+            : `🌍 Endi hamma uchun${NOTIFY_ENABLED ? " (xabarnoma navbatga qo'yildi)" : ""}`
+    );
+    await showEditMenu(ctx, code);
+});
+
+bot.action(/^eddel:(.+)$/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    await ctx.answerCbQuery();
+    const code = ctx.match[1];
+    const snap = await db.collection("films").doc(code).get();
+    if (!snap.exists) return ctx.reply("❌ Bu qism topilmadi.");
+    const f = snap.data();
+    await showOrEdit(
+        ctx,
+        `🗑 <b>${esc(f.title || "Drama")}</b>${f.episode ? " · " + esc(f.episode) : ""} (kod: <code>${esc(code)}</code>)\n\n` +
+        `Bu qism o'chirilsinmi? ⚠️ Bu amalni qaytarib bo'lmaydi.`,
+        [
+            [Markup.button.callback("✅ Ha, o'chirish", `eddelok:${code}`)],
+            [Markup.button.callback("⬅️ Yo'q, ortga", `edm:${code}`)],
+        ]
+    );
+});
+
+bot.action(/^eddelok:(.+)$/, async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    const code = ctx.match[1];
+    const ref = db.collection("films").doc(code);
+    const snap = await ref.get();
+    if (!snap.exists) {
+        await ctx.answerCbQuery("ℹ️ Allaqachon o'chirilgan.");
+        return clearInlineButtons(ctx);
+    }
+    const f = snap.data();
+    await ref.delete();
+    invalidateDramaCache();
+    removeFromNotify(code);
+    await ctx.answerCbQuery("🗑 O'chirildi");
+    await showOrEdit(
+        ctx,
+        `🗑 O'chirildi: <b>${esc(f.title || "Drama")}</b>${f.episode ? " · " + esc(f.episode) : ""} (kod: <code>${esc(code)}</code>)`,
+        []
+    );
+});
+
+bot.action("edcancel", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    delete userStates[ctx.from.id];
+    delete editTarget[ctx.from.id];
+    await ctx.answerCbQuery("Bekor qilindi.");
+    await clearInlineButtons(ctx);
+    await ctx.reply("❌ Tahrirlash bekor qilindi.");
+});
+
+bot.action("edclose", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    delete userStates[ctx.from.id];
+    delete editTarget[ctx.from.id];
+    await ctx.answerCbQuery("Yopildi.");
+    await clearInlineButtons(ctx);
+});
+
+// ─────────────────────────────────────────────
+// ADMIN: KENGAYTIRILGAN STATISTIKA
+// ─────────────────────────────────────────────
+
+async function showBotStats(ctx) {
+    const now = Date.now();
+    const TZ = 5 * 60 * 60 * 1000; // Toshkent
+    const dayStart = Math.floor((now + TZ) / DAY_MS) * DAY_MS - TZ;
+    const d7 = now - 7 * DAY_MS;
+    const d30 = now - 30 * DAY_MS;
+
+    const [usersSnap, filmsSnap, vipSnap, paySnap] = await Promise.all([
+        db.collection("users").get(),
+        db.collection("films").get(),
+        db.collection("vips").get(),
+        db.collection("payments").get(),
+    ]);
+
+    let total = 0, newToday = 0, new7 = 0, new30 = 0, actToday = 0, act7 = 0, muted = 0;
+    usersSnap.forEach((d) => {
+        const u = d.data();
+        total++;
+        const j = tsToMs(u.joinedAt);
+        if (j >= dayStart) newToday++;
+        if (j >= d7) new7++;
+        if (j >= d30) new30++;
+        const a = tsToMs(u.lastActiveAt);
+        if (a >= dayStart) actToday++;
+        if (a >= d7) act7++;
+        if (u.notifyOff === true) muted++;
+    });
+
+    let episodes = 0, vipEpisodes = 0, totalViews = 0;
+    const eps = [];
+    const dramas = new Map();
+    filmsSnap.forEach((d) => {
+        const f = d.data();
+        const views = Number(f.views) || 0;
+        episodes++;
+        if (f.vipOnly === true) vipEpisodes++;
+        totalViews += views;
+        eps.push({ code: d.id, title: f.title || "Nomsiz", episode: f.episode || "", views });
+        const key = dramaKey(f.title);
+        if (!dramas.has(key)) dramas.set(key, { title: String(f.title || "Nomsiz").trim(), views: 0, count: 0 });
+        const g = dramas.get(key);
+        g.views += views;
+        g.count++;
+    });
+
+    let activeVip = 0;
+    vipSnap.forEach((d) => {
+        if (tsToMs(d.data().expiresAt) > now) activeVip++;
+    });
+
+    let revToday = 0, rev30 = 0, revAll = 0, pending = 0;
+    paySnap.forEach((d) => {
+        const p = d.data();
+        if (p.status === "pending") pending++;
+        if (p.status !== "approved") return;
+        const amount = paymentAmount(p);
+        const when = tsToMs(p.decidedAt) || tsToMs(p.createdAt);
+        revAll += amount;
+        if (when >= dayStart) revToday += amount;
+        if (when >= d30) rev30 += amount;
+    });
+
+    const topEps = eps.sort((a, b) => b.views - a.views).slice(0, 10).filter((e) => e.views > 0);
+    const topDramas = [...dramas.values()].sort((a, b) => b.views - a.views).slice(0, 5).filter((g) => g.views > 0);
+
+    let text =
+        `📈 <b>Bot statistikasi</b>\n` +
+        `<i>${fmtDate(now)} holatiga</i>\n\n` +
+        `👥 <b>Foydalanuvchilar</b>\n` +
+        `• Jami: <b>${total}</b> ta\n` +
+        `• Yangi: bugun <b>${newToday}</b> · 7 kunda ${new7} · 30 kunda ${new30}\n` +
+        `• Faol: bugun <b>${actToday}</b> · 7 kunda ${act7}\n` +
+        `• 🔕 Xabarnomani o'chirganlar: ${muted}\n\n` +
+        `🎬 <b>Kontent</b>\n` +
+        `• Dramalar: <b>${dramas.size}</b> ta · Qismlar: ${episodes} ta (💎 VIP: ${vipEpisodes})\n` +
+        `• 👁 Jami ko'rishlar: <b>${formatSum(totalViews)}</b>\n\n` +
+        `💎 <b>VIP</b>\n` +
+        `• Faol VIP: <b>${activeVip}</b> ta · Kutilayotgan to'lov: ${pending}\n` +
+        `• 💰 Tushum: bugun ${formatSum(revToday)} · 30 kunda ${formatSum(rev30)} · jami ${formatSum(revAll)} so'm`;
+
+    if (topEps.length) {
+        text += `\n\n🔥 <b>Eng ko'p ko'rilgan qismlar</b>`;
+        topEps.forEach((e, i) => {
+            text +=
+                `\n${i + 1}. ${esc(shorten(e.title, 35))}${e.episode ? " · " + esc(e.episode) : ""}` +
+                ` — 👁 ${formatSum(e.views)} (<code>${esc(e.code)}</code>)`;
+        });
+    }
+    if (topDramas.length) {
+        text += `\n\n🏆 <b>Eng mashhur dramalar</b>`;
+        topDramas.forEach((g, i) => {
+            text += `\n${i + 1}. ${esc(shorten(g.title, 40))} — 👁 ${formatSum(g.views)} (${g.count} qism)`;
+        });
+    }
+    text += `\n\nℹ️ "Faol" ko'rsatkichi shu yangilanishdan boshlab yig'iladi.`;
+
+    return showOrEdit(ctx, text, [[Markup.button.callback("🔄 Yangilash", "stats_refresh")]]);
+}
 
 // ─────────────────────────────────────────────
 // TEXT HANDLER
@@ -1644,11 +2929,16 @@ bot.on("text", async (ctx) => {
         if (state === "waiting_for_vip_target_grant" || state === "waiting_for_vip_target_revoke") {
             const target = await resolveUser(text);
             if (!target) {
-                return ctx.reply("❌ Foydalanuvchi topilmadi. U botdan foydalangan bo'lishi kerak. @username yoki ID ni qayta yuboring:");
+                return ctx.reply("❌ Foydalanuvchi topilmadi. ID raqamini yoki @username'ni qayta yuboring:");
             }
 
             if (state === "waiting_for_vip_target_revoke") {
-                await db.collection("vips").doc(String(target.userId)).delete();
+                const vipRef = db.collection("vips").doc(String(target.userId));
+                if (!(await vipRef.get()).exists) {
+                    delete userStates[userId];
+                    return ctx.reply(`ℹ️ ${displayName(target)} VIP emas.`);
+                }
+                await vipRef.delete();
                 delete userStates[userId];
                 return ctx.reply(`✅ ${displayName(target)} dan VIP olib tashlandi.`);
             }
@@ -1656,7 +2946,7 @@ bot.on("text", async (ctx) => {
             vipAdminTarget[userId] = target;
             userStates[userId] = "waiting_for_vip_days";
             return ctx.reply(
-                `👤 ${displayName(target)}${target.username ? " (@" + target.username + ")" : ""}\n\nNecha kunlik VIP berilsin? Tugmani bosing yoki kun sonini yozing:`,
+                `👤 ${displayName(target)}${target.username ? " (@" + target.username + ")" : ""}\n🆔 ${target.userId}\n\nNecha kunlik VIP berilsin? Tugmani bosing yoki kun sonini yozing:`,
                 Markup.inlineKeyboard([
                     [
                         Markup.button.callback("30 kun", "vipg:30"),
@@ -1672,12 +2962,42 @@ bot.on("text", async (ctx) => {
             if (!/^\d{1,4}$/.test(text) || parseInt(text, 10) < 1) {
                 return ctx.reply("❌ Kun sonini raqam bilan yozing (masalan: 45) yoki tugmani bosing.");
             }
+            return askVipPayType(ctx, parseInt(text, 10));
+        }
+
+        // VIP boshqaruvi: pullik/tekin tanlovi kutilmoqda
+        if (state === "waiting_for_vip_paytype") {
+            return ctx.reply("❗️ Iltimos, yuqoridagi tugmalardan birini tanlang: pullik, boshqa summa yoki tekin.");
+        }
+
+        // VIP boshqaruvi: boshqa summa yozildi
+        if (state === "waiting_for_vip_amount") {
+            if (!/^[\d\s]{1,12}$/.test(text)) {
+                return ctx.reply("❌ Summani faqat raqam bilan yozing (masalan: 25000). Tekin uchun 0.");
+            }
             try {
-                return await completeManualGrant(ctx, parseInt(text, 10));
+                return await completeManualGrant(ctx, parseAmount(text));
             } catch (err) {
                 console.error("completeManualGrant xatolik:", err);
                 return ctx.reply("❌ Xatolik yuz berdi. Qayta urinib ko'ring.");
             }
+        }
+
+        // Qismni tahrirlash: kod kutilmoqda
+        if (state === "waiting_for_edit_code") {
+            if (!isValidCode(text) || !(await db.collection("films").doc(text).get()).exists) {
+                return ctx.reply("❌ Bunday kodli qism topilmadi. Kodni qayta yuboring:");
+            }
+            delete userStates[userId];
+            return showEditMenu(ctx, text);
+        }
+
+        // Qismni tahrirlash: yangi qiymat
+        if (state === "waiting_for_edit_value") {
+            return applyEditValue(ctx, text);
+        }
+        if (state === "waiting_for_edit_video") {
+            return ctx.reply("❗️ Iltimos, yangi videoni video fayl sifatida yuboring.");
         }
     }
 
@@ -1686,42 +3006,12 @@ bot.on("text", async (ctx) => {
     if (!subscribed) return;
 
     // ── Kino kodi bilan qidiruv ──
-    const filmDoc = isValidCode(text) ? await db.collection("films").doc(text).get() : null;
-    if (filmDoc && filmDoc.exists) {
-        const film = filmDoc.data();
+    if (await sendEpisode(ctx, text)) return;
 
-        // VIP uchun yopiq qism
-        if (film.vipOnly === true && !(await hasVipAccess(userId))) {
-            return ctx.reply(
-                `🔒 <b>${esc(film.title || "Drama")}</b>${film.episode ? " · " + esc(film.episode) : ""}\n\n` +
-                `Bu qism hozircha <b>faqat VIP</b> foydalanuvchilar uchun.\n` +
-                `⏳ Oddiy foydalanuvchilar uchun u keyinroq ochiladi.\n\n` +
-                `💎 VIP bilan yangi qismlarni ${VIP_AHEAD} qism oldin va reklamasiz ko'ring!`,
-                {
-                    parse_mode: "HTML",
-                    ...Markup.inlineKeyboard([[Markup.button.callback("💎 VIP haqida", "vip_info")]]),
-                }
-            );
-        }
-
-        try {
-            await incrementViewCount(text);
-            const updatedViews = (film.views || 0) + 1;
-
-            const requesterUsername = (ctx.from.username || "").toLowerCase();
-            const canDownload = DOWNLOAD_USERNAMES.has(requesterUsername);
-
-            await ctx.replyWithVideo(film.video_link, {
-                caption: buildCaption(film, updatedViews),
-                parse_mode: "HTML",
-                protect_content: !canDownload,
-            });
-        } catch (err) {
-            console.error("Video yuborishda xatolik:", err.message);
-            await ctx.reply("❌ Video yuborishda xatolik yuz berdi.");
-        }
-        return;
-    }
+    // ── Nomi bo'yicha qidiruv ──
+    const groups = await loadDramaGroups();
+    const matches = searchDramas(groups, text);
+    if (matches.length > 0) return showSearchResults(ctx, groups, matches, text);
 
     // ── Topilmasa so'rov yuborish ──
     const requested = text.slice(0, 200);
@@ -1729,7 +3019,7 @@ bot.on("text", async (ctx) => {
         title: requested,
         requestedAt: admin.firestore.Timestamp.now(),
     });
-    await ctx.reply("⏳ Ushbu drama hozircha bazada mavjud emas.\n\n📌 So'rovingiz adminlarga yuborildi!");
+    await ctx.reply("😔 Bunday kod yoki nomdagi drama topilmadi.\n\n📌 So'rovingiz adminlarga yuborildi, tez orada qo'shishga harakat qilamiz!");
     try {
         await bot.telegram.sendMessage(
             ADMIN_CHAT_ID,
@@ -1795,6 +3085,7 @@ bot.catch(async (err, ctx) => {
         await seedChannelsIfEmpty();
         await loadChannels();
         await loadDownloadUsers();
+        await backfillManualVipPayments().catch((e) => console.error("backfillManualVipPayments:", e.message));
     } catch (err) {
         console.error("Ishga tushirishda xatolik:", err);
         process.exit(1);
