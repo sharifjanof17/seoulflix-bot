@@ -258,12 +258,36 @@ function storeDeleteFilm(code) {
     invalidateDramaCache();
 }
 
-function filmsOfDrama(dramaId) {
+// Bitta dramaning qismlari = nomi bir xil bo'lgan qismlar (ro'yxatda ham shunday guruhlanadi).
+// dramaId ishlatilmaydi: shablondan noto'g'ri qo'shilib, keyin nomi tuzatilgan qismlar aralashmasligi uchun.
+function filmsOfTitle(title) {
+    const key = dramaKey(title);
     const list = [];
     for (const [code, f] of filmStore) {
-        if (f.dramaId === dramaId) list.push({ code, f });
+        if (dramaKey(f.title) === key) list.push({ code, f });
     }
     return list;
+}
+
+// Admin uchun: bitta qismni bazadan qayta o'qib, keshni yangilaydi (konsolda qilingan o'zgarishlar uchun)
+async function refreshFilmFromDb(code) {
+    if (!isValidCode(code)) return { changed: false };
+    await ensureFilmStore();
+    const snap = await db.collection("films").doc(code).get();
+    const old = filmStore.get(code);
+    if (!snap.exists) {
+        if (old) {
+            storeDeleteFilm(code);
+            return { changed: true, deleted: true };
+        }
+        return { changed: false };
+    }
+    const fresh = snap.data();
+    fresh.views = (Number(fresh.views) || 0) + (pendingViews.get(code) || 0);
+    const KEYS = ["title", "episode", "epNo", "video_link", "vipOnly", "description", "year", "genre", "language", "translator", "dramaId"];
+    const changed = !old || KEYS.some((k) => JSON.stringify(old[k]) !== JSON.stringify(fresh[k]));
+    if (changed) storePutFilm(code, fresh);
+    return { changed };
 }
 
 // Ko'rishlar: xotirada yig'iladi, keyin bitta to'plam bilan yoziladi
@@ -758,7 +782,7 @@ async function vipReminderJob() {
 async function getNextCode() {
     await ensureFilmStore();
     let max = 0;
-    let width = 4;
+    let width = 1; // mavjud kodlar uzunligiga moslashadi (351 -> 352, 0351 -> 0352)
     for (const id of filmStore.keys()) {
         if (/^\d+$/.test(id)) {
             max = Math.max(max, parseInt(id, 10));
@@ -768,10 +792,10 @@ async function getNextCode() {
     return String(max + 1).padStart(width, "0");
 }
 
-async function getMaxEpNo(dramaId, fallback) {
+async function getMaxEpNo(title, fallback) {
     await ensureFilmStore();
     let max = fallback || 0;
-    filmsOfDrama(dramaId).forEach(({ f }) => {
+    filmsOfTitle(title).forEach(({ f }) => {
         if (typeof f.epNo === "number" && f.epNo > max) max = f.epNo;
     });
     return max;
@@ -790,9 +814,9 @@ async function openEpisodes(list) {
 }
 
 // VIP uchun yopiq qismlar soni VIP_AHEAD dan oshsa, eng eskilari hammaga ochiladi
-async function applyVipWindow(dramaId) {
+async function applyVipWindow(title) {
     await ensureFilmStore();
-    const vipEps = filmsOfDrama(dramaId)
+    const vipEps = filmsOfTitle(title)
         .filter(({ f }) => f.vipOnly === true)
         .sort((a, b) => (a.f.epNo || 0) - (b.f.epNo || 0));
     const excess = vipEps.length - VIP_AHEAD;
@@ -801,9 +825,9 @@ async function applyVipWindow(dramaId) {
 }
 
 // Ochilgan qismlar ro'yxatini qaytaradi
-async function openAllEpisodes(dramaId) {
+async function openAllEpisodes(title) {
     await ensureFilmStore();
-    return openEpisodes(filmsOfDrama(dramaId).filter(({ f }) => f.vipOnly === true));
+    return openEpisodes(filmsOfTitle(title).filter(({ f }) => f.vipOnly === true));
 }
 
 function makeTemplate(film, code) {
@@ -899,12 +923,20 @@ async function askNextEpisode(ctx) {
     const userId = ctx.from.id;
     userStates[userId] = "waiting_for_ep_code";
     const nextCode = await getNextCode();
+    const tpl = episodeTemplates[userId];
+    const dramaLine = tpl && tpl.base.title
+        ? `🎬 Drama: <b>${esc(tpl.base.title)}</b>\n🎞 Keyingi qism: ${(await getMaxEpNo(tpl.base.title, tpl.lastEpNo)) + 1}-qism\n\n`
+        : "";
     await ctx.reply(
-        "🔑 Yangi qism kodini yuboring:",
-        Markup.inlineKeyboard([
-            [Markup.button.callback(`🔢 Avtomatik kod: ${nextCode}`, "ep_autocode")],
-            [Markup.button.callback("✅ Tugatish", "ep_finish")],
-        ])
+        `${dramaLine}🔑 Yangi qism kodini yuboring:` +
+        (dramaLine ? "\n\n⚠️ Boshqa dramaga qism qo'shmoqchi bo'lsangiz «✅ Tugatish» ni bosib, «➕ Qism qo'shish» dan qaytadan boshlang." : ""),
+        {
+            parse_mode: "HTML",
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback(`🔢 Avtomatik kod: ${nextCode}`, "ep_autocode")],
+                [Markup.button.callback("✅ Tugatish", "ep_finish")],
+            ]),
+        }
     );
 }
 
@@ -922,7 +954,7 @@ async function acceptEpisodeCode(ctx, code) {
         return ctx.reply(`⚠️ "${code}" kodi band. Boshqa kod yuboring:`);
     }
 
-    const next = (await getMaxEpNo(tpl.dramaId, tpl.lastEpNo)) + 1;
+    const next = (await getMaxEpNo(tpl.base.title, tpl.lastEpNo)) + 1;
     filmDrafts[userId] = { ...tpl.base, code, dramaId: tpl.dramaId, suggestedEp: next };
     userStates[userId] = "waiting_for_ep_number";
 
@@ -943,7 +975,7 @@ async function acceptEpisodeNumber(ctx, epNo, label) {
         return ctx.reply("❌ Ma'lumot topilmadi. Qaytadan boshlang.");
     }
     await ensureFilmStore();
-    const dup = filmsOfDrama(draft.dramaId).find(({ f }) => f.epNo === epNo);
+    const dup = filmsOfTitle(draft.title).find(({ f }) => f.epNo === epNo);
     if (dup) {
         return ctx.reply(`❌ ${epNo}-qism allaqachon mavjud (kod: ${dup.code}). Boshqa raqam yuboring:`);
     }
@@ -984,7 +1016,7 @@ async function finalizeFilm(ctx, fileId) {
     try {
         await db.collection("films").doc(draft.code).set(filmData);
         storePutFilm(draft.code, filmData);
-        if (filmData.vipOnly) opened = await applyVipWindow(filmData.dramaId);
+        if (filmData.vipOnly) opened = await applyVipWindow(filmData.title);
     } catch (err) {
         console.error("Qism saqlashda xatolik:", err);
         return ctx.reply("❌ Saqlashda xatolik yuz berdi. Videoni qayta yuboring.");
@@ -1798,6 +1830,31 @@ bot.hears([BTN.COUNT, LEGACY_COUNT_BTN], async (ctx) => {
     await showBotStats(ctx);
 });
 
+// Firebase Console'da qo'lda o'zgartirish kiritilgandan keyin botni darhol yangilash
+async function reloadCachesFromDb(ctx) {
+    try {
+        await flushViews();
+        await ensureFilmStore(true);
+        vipStoreReady = false;
+        await ensureVipStore();
+        await ctx.reply(`♻️ Bot xotirasi bazadan yangilandi: ${filmStore.size} ta qism, ${vipStore.size} ta VIP.`);
+    } catch (err) {
+        console.error("reloadCachesFromDb:", err.message);
+        await ctx.reply("❌ Yangilab bo'lmadi: " + (isQuotaError(err) ? "Firestore limiti tugagan." : err.message));
+    }
+}
+
+bot.command("yangilash", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return;
+    await reloadCachesFromDb(ctx);
+});
+
+bot.action("cache_reload", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    await ctx.answerCbQuery("Yangilanmoqda...");
+    await reloadCachesFromDb(ctx);
+});
+
 bot.action("stats_refresh", async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
     await ctx.answerCbQuery("Yangilandi");
@@ -2014,7 +2071,7 @@ bot.action("ep_open_all", async (ctx) => {
     if (!tpl) return ctx.answerCbQuery("Amal muddati o'tgan.");
     await ctx.answerCbQuery();
     try {
-        const opened = await openAllEpisodes(tpl.dramaId);
+        const opened = await openAllEpisodes(tpl.base.title);
         invalidateDramaCache();
         opened.forEach((o) => enqueueNotify(o, "opened"));
         await ctx.reply(
@@ -2278,6 +2335,14 @@ async function showSearchResults(ctx, groups, matches, query) {
 // Kod bo'yicha qism topilmasa false qaytaradi.
 async function sendEpisode(ctx, code) {
     const userId = ctx.from.id;
+    let refreshed = null;
+    if (userId === ADMIN_ID && isValidCode(code)) {
+        refreshed = await refreshFilmFromDb(code).catch(() => null);
+        if (refreshed && refreshed.deleted) {
+            await ctx.reply(`ℹ️ ${code} kodi bazada yo'q (konsoldan o'chirilgan). Kesh yangilandi.`);
+            return true;
+        }
+    }
     const film = await getFilm(code);
     if (!film) return false;
 
@@ -2349,7 +2414,10 @@ async function sendEpisode(ctx, code) {
 
         // Admin uchun: kanal postiga qo'yish uchun tayyor havolalar
         if (userId === ADMIN_ID && uname && isDeepLinkSafe(code)) {
-            let links = `🔗 Qism havolasi:\n<code>https://t.me/${uname}?start=${esc(code)}</code>`;
+            let links = refreshed && refreshed.changed
+                ? "♻️ Bu qism Firebase'da o'zgartirilgan ekan — bot xotirasi yangilandi.\n\n"
+                : "";
+            links += `🔗 Qism havolasi:\n<code>https://t.me/${uname}?start=${esc(code)}</code>`;
             if (group && isDeepLinkSafe(`dr_${group.key}`)) {
                 links += `\n\n📜 Barcha qismlar havolasi:\n<code>https://t.me/${uname}?start=dr_${esc(group.key)}</code>`;
             }
@@ -2650,7 +2718,8 @@ bot.action("notif_on", async (ctx) => {
 // ─────────────────────────────────────────────
 
 const EDIT_FIELDS = {
-    t: { key: "title", label: "🎬 Nomi" },
+    t: { key: "title", label: "🎬 Nomi (butun drama)" },
+    t1: { key: "title", label: "🎬 Nomi (faqat shu qism)" },
     e: { key: "episode", label: "🎞 Qism" },
     y: { key: "year", label: "🗓 Yil" },
     tr: { key: "translator", label: "🎧 Tarjimon" },
@@ -2686,8 +2755,9 @@ async function showEditMenu(ctx, code) {
 
     const b = (k) => Markup.button.callback(EDIT_FIELDS[k].label, `ed:${k}:${code}`);
     const keyboard = [
-        [b("t"), b("e")],
-        [b("y"), b("tr")],
+        [b("t"), b("t1")],
+        [b("e"), b("y")],
+        [b("tr")],
         [b("l"), b("g")],
         [b("d"), b("v")],
         [
@@ -2721,7 +2791,7 @@ bot.action(/^edm:(.+)$/, async (ctx) => {
     await showEditMenu(ctx, ctx.match[1]);
 });
 
-bot.action(/^ed:(t|e|y|tr|l|g|d|v):(.+)$/, async (ctx) => {
+bot.action(/^ed:(t1|t|e|y|tr|l|g|d|v):(.+)$/, async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
     await ctx.answerCbQuery();
     const field = ctx.match[1];
@@ -2739,6 +2809,10 @@ bot.action(/^ed:(t|e|y|tr|l|g|d|v):(.+)$/, async (ctx) => {
         const group = findGroupByCode(groups, code);
         const n = group ? group.eps.length : 1;
         prompt = `🎬 Yangi nomni yuboring.\n\n⚠️ Butun dramaning nomi o'zgaradi (${n} ta qism).`;
+    } else if (field === "t1") {
+        prompt =
+            "🎬 Faqat shu qism uchun yangi nomni yuboring.\n\n" +
+            "💡 Qism boshqa dramaga noto'g'ri qo'shilgan bo'lsa, shu yerda to'g'ri drama nomini aynan bir xil yozing — qism o'sha dramaga o'tadi.";
     } else if (field === "e") {
         prompt = "🎞 Yangi qism raqamini yuboring (masalan: 5 yoki 5-qism).";
     } else if (field === "v") {
@@ -2771,7 +2845,14 @@ async function applyEditValue(ctx, value) {
     let note = "";
 
     try {
-        if (t.field === "t") {
+        if (t.field === "t1") {
+            const title = String(value).trim();
+            if (!title || title === "-") return ctx.reply("❌ Nom bo'sh bo'lishi mumkin emas. Qayta yuboring:");
+            if (title.length > 200) return ctx.reply("❌ Nom juda uzun (200 belgigacha). Qayta yuboring:");
+            await ref.update({ title });
+            storePatchFilm(t.code, { title });
+            note = " (faqat shu qismda)";
+        } else if (t.field === "t") {
             const title = String(value).trim();
             if (!title || title === "-") return ctx.reply("❌ Nom bo'sh bo'lishi mumkin emas. Qayta yuboring:");
             if (title.length > 200) return ctx.reply("❌ Nom juda uzun (200 belgigacha). Qayta yuboring:");
@@ -2996,7 +3077,10 @@ async function showBotStats(ctx) {
     }
     text += `\n\nℹ️ "Faol" ko'rsatkichi shu yangilanishdan boshlab yig'iladi. Ko'rishlar soni bazaga har 20 daqiqada yoziladi.`;
 
-    return showOrEdit(ctx, text, [[Markup.button.callback("🔄 Yangilash", "stats_refresh")]]);
+    return showOrEdit(ctx, text, [
+        [Markup.button.callback("🔄 Statistikani yangilash", "stats_refresh")],
+        [Markup.button.callback("♻️ Bot xotirasini bazadan yangilash", "cache_reload")],
+    ]);
 }
 
 // ─────────────────────────────────────────────
@@ -3085,7 +3169,7 @@ bot.on("text", async (ctx) => {
                 storePatchFilm(text, { dramaId, epNo: baseEp });
             }
 
-            const lastEpNo = await getMaxEpNo(dramaId, baseEp);
+            const lastEpNo = await getMaxEpNo(b.title, baseEp);
             episodeTemplates[userId] = makeTemplate({ ...b, dramaId, epNo: lastEpNo }, text);
             await ctx.reply(
                 `✅ Drama topildi: ${b.title || text}\n🎞 Oxirgi qism raqami: ${lastEpNo}`
