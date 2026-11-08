@@ -180,6 +180,248 @@ async function sendChunks(ctx, header, lines, extra = { parse_mode: "HTML" }) {
     for (const chunk of chunks) await ctx.reply(chunk, extra);
 }
 
+// ─────────────────────────────────────────────
+// XOTIRA KESHI — Firestore bepul limitini (kuniga 50k o'qish / 20k yozish) tejash uchun
+//   • qismlar (films)   — ishga tushganda 1 marta o'qiladi, keyin har 6 soatda yangilanadi
+//   • VIP'lar (vips)    — ishga tushganda va har 6 soatda (eslatma ishi bilan birga)
+//   • foydalanuvchilar  — faqat kerak bo'lganda (reklama, xabarnoma, statistika) 1 marta
+//   • ko'rishlar soni   — xotirada yig'ilib, har 20 daqiqada bitta to'plam bilan yoziladi
+//   • faollik           — har kunga bitta hujjat
+// Bot orqali qilingan barcha o'zgarishlar keshga darhol yoziladi.
+// ─────────────────────────────────────────────
+
+const FILM_RELOAD_MS = 6 * 60 * 60 * 1000;
+const VIEW_FLUSH_MS = 20 * 60 * 1000;
+const ACTIVITY_FLUSH_MS = 20 * 60 * 1000;
+
+function isQuotaError(err) {
+    if (!err) return false;
+    return err.code === 8 || /RESOURCE_EXHAUSTED|Quota exceeded/i.test(String(err.message || err.details || ""));
+}
+
+// ── Qismlar ──
+const filmStore = new Map(); // code -> film data
+let filmStoreReady = false;
+let filmStoreAt = 0;
+let filmLoadPromise = null;
+const pendingViews = new Map(); // code -> bazaga hali yozilmagan ko'rishlar
+
+async function ensureFilmStore(force = false) {
+    if (!force && filmStoreReady && Date.now() - filmStoreAt < FILM_RELOAD_MS) return;
+    if (!filmLoadPromise) {
+        filmLoadPromise = (async () => {
+            const snap = await db.collection("films").get();
+            filmStore.clear();
+            snap.forEach((d) => filmStore.set(d.id, d.data()));
+            for (const [code, n] of pendingViews) {
+                const f = filmStore.get(code);
+                if (f) f.views = (Number(f.views) || 0) + n;
+            }
+            filmStoreReady = true;
+            filmStoreAt = Date.now();
+            invalidateDramaCache();
+            console.log(`🎬 Qismlar keshga yuklandi: ${filmStore.size} ta`);
+        })().finally(() => {
+            filmLoadPromise = null;
+        });
+    }
+    try {
+        await filmLoadPromise;
+    } catch (err) {
+        // eski kesh bor bo'lsa, u bilan ishlashda davom etamiz
+        if (!filmStoreReady) throw err;
+        console.error("Qismlarni yangilab bo'lmadi, eski kesh ishlatiladi:", err.message);
+        filmStoreAt = Date.now() - FILM_RELOAD_MS + 15 * 60 * 1000; // 15 daqiqadan keyin qayta urinish
+    }
+}
+
+async function getFilm(code) {
+    if (!isValidCode(code)) return null;
+    await ensureFilmStore();
+    return filmStore.get(code) || null;
+}
+
+function storePutFilm(code, data) {
+    filmStore.set(code, { ...data });
+    invalidateDramaCache();
+}
+
+function storePatchFilm(code, patch) {
+    const f = filmStore.get(code);
+    if (f) Object.assign(f, patch);
+    invalidateDramaCache();
+}
+
+function storeDeleteFilm(code) {
+    filmStore.delete(code);
+    pendingViews.delete(code);
+    invalidateDramaCache();
+}
+
+function filmsOfDrama(dramaId) {
+    const list = [];
+    for (const [code, f] of filmStore) {
+        if (f.dramaId === dramaId) list.push({ code, f });
+    }
+    return list;
+}
+
+// Ko'rishlar: xotirada yig'iladi, keyin bitta to'plam bilan yoziladi
+function addView(code) {
+    pendingViews.set(code, (pendingViews.get(code) || 0) + 1);
+    const f = filmStore.get(code);
+    if (f) f.views = (Number(f.views) || 0) + 1;
+}
+
+async function flushViews() {
+    if (pendingViews.size === 0) return;
+    const entries = [...pendingViews.entries()].filter(([code]) => filmStore.has(code));
+    pendingViews.clear();
+    for (let i = 0; i < entries.length; i += 400) {
+        const chunk = entries.slice(i, i + 400);
+        const batch = db.batch();
+        chunk.forEach(([code, n]) =>
+            batch.update(db.collection("films").doc(code), { views: admin.firestore.FieldValue.increment(n) })
+        );
+        try {
+            await batch.commit();
+        } catch (err) {
+            if (err.code === 5) {
+                // ba'zi qism bazada yo'q (konsoldan o'chirilgan): qolganlarini bittalab yozamiz
+                for (const [code, n] of chunk) {
+                    await db
+                        .collection("films")
+                        .doc(code)
+                        .update({ views: admin.firestore.FieldValue.increment(n) })
+                        .catch(() => { });
+                }
+            } else {
+                // keyingi safar qayta urinamiz
+                chunk.forEach(([code, n]) => pendingViews.set(code, (pendingViews.get(code) || 0) + n));
+                console.error("Ko'rishlarni yozib bo'lmadi, keyinroq qayta urinamiz:", err.message);
+                return;
+            }
+        }
+    }
+}
+
+// ── VIP'lar ──
+const vipStore = new Map(); // userId (string) -> expiresMs
+let vipStoreReady = false;
+let vipLoadPromise = null;
+
+function fillVipStore(snap) {
+    vipStore.clear();
+    snap.forEach((d) => {
+        const v = d.data();
+        vipStore.set(String(v.userId || d.id), tsToMs(v.expiresAt));
+    });
+    vipStoreReady = true;
+}
+
+async function ensureVipStore() {
+    if (vipStoreReady) return;
+    if (!vipLoadPromise) {
+        vipLoadPromise = db
+            .collection("vips")
+            .get()
+            .then(fillVipStore)
+            .finally(() => {
+                vipLoadPromise = null;
+            });
+    }
+    await vipLoadPromise;
+}
+
+function vipStoreSet(userId, expiresMs) {
+    vipStore.set(String(userId), expiresMs);
+}
+
+// ── Foydalanuvchilar (faqat kerak bo'lganda yuklanadi) ──
+const userStore = new Map(); // userId (string) -> { joinedMs, notifyOff, username }
+let userStoreReady = false;
+let userLoadPromise = null;
+
+async function ensureUserStore() {
+    if (userStoreReady) return;
+    if (!userLoadPromise) {
+        userLoadPromise = (async () => {
+            const snap = await db.collection("users").get();
+            userStore.clear();
+            snap.forEach((d) => {
+                const u = d.data();
+                userStore.set(String(u.userId || d.id), {
+                    joinedMs: tsToMs(u.joinedAt),
+                    notifyOff: u.notifyOff === true,
+                    username: u.username || "",
+                    firstName: u.firstName || "",
+                    lastName: u.lastName || "",
+                });
+            });
+            userStoreReady = true;
+            console.log(`👥 Foydalanuvchilar keshga yuklandi: ${userStore.size} ta`);
+        })().finally(() => {
+            userLoadPromise = null;
+        });
+    }
+    await userLoadPromise;
+}
+
+async function removeBlockedUser(uid) {
+    userStore.delete(String(uid));
+    await db.collection("users").doc(String(uid)).delete().catch(() => { });
+}
+
+// ── Faollik: har kun uchun bitta hujjat (stats/activity_dd.mm.yyyy) ──
+let activity = { day: "", ids: new Set(), dirty: false, loaded: false };
+
+function activityDocId(day) {
+    return `activity_${day}`;
+}
+
+async function saveActivity(a) {
+    if (!a.dirty || !a.day) return;
+    a.dirty = false;
+    const ids = [...a.ids];
+    try {
+        await db
+            .collection("stats")
+            .doc(activityDocId(a.day))
+            .set({ day: a.day, count: ids.length, ids: ids.length <= 40000 ? ids : [] }, { merge: true });
+    } catch (err) {
+        a.dirty = true;
+        console.error("Faollikni yozib bo'lmadi:", err.message);
+    }
+}
+
+function touchUser(from) {
+    if (!from || from.is_bot) return;
+    const day = fmtDate(Date.now());
+    if (activity.day !== day) {
+        const prev = activity;
+        activity = { day, ids: new Set(), dirty: false, loaded: false };
+        saveActivity(prev);
+        // bot qayta ishga tushgan bo'lsa, bugungi ro'yxatni tiklaymiz (1 o'qish)
+        const cur = activity;
+        db.collection("stats")
+            .doc(activityDocId(day))
+            .get()
+            .then((d) => {
+                if (d.exists && Array.isArray(d.data().ids)) d.data().ids.forEach((id) => cur.ids.add(id));
+                cur.loaded = true;
+            })
+            .catch(() => { });
+    }
+    if (!activity.ids.has(from.id)) {
+        activity.ids.add(from.id);
+        activity.dirty = true;
+    }
+}
+
+async function flushAllCaches() {
+    await Promise.allSettled([flushViews(), saveActivity(activity)]);
+}
+
 async function loadDownloadUsers() {
     const snapshot = await db.collection("vipUsers").get();
     DOWNLOAD_USERNAMES = new Set(snapshot.docs.map((doc) => doc.id));
@@ -214,26 +456,33 @@ async function seedChannelsIfEmpty() {
 
 async function getVipInfo(userId) {
     const snap = await db.collection("vips").doc(String(userId)).get();
-    if (!snap.exists) return null;
+    if (!snap.exists) {
+        vipStore.delete(String(userId));
+        return null;
+    }
     const data = snap.data();
     const expiresMs = tsToMs(data.expiresAt);
+    vipStoreSet(userId, expiresMs);
     return { ...data, expiresMs, active: expiresMs > Date.now() };
 }
 
 // Admin har doim VIP huquqiga ega
 async function hasVipAccess(userId) {
     if (userId === ADMIN_ID) return true;
-    const info = await getVipInfo(userId);
-    return !!(info && info.active);
+    try {
+        await ensureVipStore();
+    } catch (err) {
+        console.error("VIP keshini yuklab bo'lmadi:", err.message);
+        return false;
+    }
+    return (vipStore.get(String(userId)) || 0) > Date.now();
 }
 
 async function getActiveVipIds() {
-    const snap = await db.collection("vips").get();
+    await ensureVipStore();
     const now = Date.now();
     const ids = new Set();
-    snap.forEach((doc) => {
-        if (tsToMs(doc.data().expiresAt) > now) ids.add(doc.id);
-    });
+    for (const [id, exp] of vipStore) if (exp > now) ids.add(id);
     return ids;
 }
 
@@ -287,11 +536,17 @@ async function grantVipDays(target, days, grantedBy, amount = priceForDays(days)
             decidedAt: admin.firestore.Timestamp.now(),
         });
         return expiresMs;
+    }).then((expiresMs) => {
+        vipStoreSet(target.userId, expiresMs);
+        return expiresMs;
     });
 }
 
 // Bir martalik: avval admin qo'lda bergan (to'lov yozuvi yo'q) VIP'lar uchun to'lov yozuvini tiklaydi
 async function backfillManualVipPayments() {
+    // Faqat bir marta ishlaydi (har ishga tushganda butun bazani o'qimaslik uchun)
+    const flagRef = db.collection("meta").doc("backfill_vip_payments_v1");
+    if ((await flagRef.get()).exists) return;
     const [vipSnap, paySnap] = await Promise.all([
         db.collection("vips").get(),
         db.collection("payments").get(),
@@ -330,6 +585,7 @@ async function backfillManualVipPayments() {
         added++;
     }
     if (added) console.log(`💎 ${added} ta qo'lda berilgan VIP uchun to'lov yozuvi tiklandi.`);
+    await flagRef.set({ done: true, added, at: admin.firestore.Timestamp.now() });
 }
 
 // To'lovni tasdiqlash: bir marta ishlashi kafolatlangan (qayta bosilsa ikki marta VIP bermaydi)
@@ -357,6 +613,9 @@ async function approvePayment(paymentId) {
         );
         t.update(payRef, { status: "approved", decidedAt: admin.firestore.Timestamp.now() });
         return { status: "approved", userId: p.userId, expiresMs };
+    }).then((res) => {
+        if (res.status === "approved") vipStoreSet(res.userId, res.expiresMs);
+        return res;
     });
 }
 
@@ -407,10 +666,16 @@ async function resolveUser(input) {
     }
     const uname = t.replace(/^@/, "").toLowerCase();
     if (!uname) return null;
-    for (const col of ["users", "vips"]) {
-        const snap = await db.collection(col).get();
-        const found = snap.docs.find((d) => String(d.data().username || "").toLowerCase() === uname);
-        if (found) return { ...found.data(), userId: Number(found.data().userId || found.id) };
+    await ensureUserStore();
+    for (const [id, u] of userStore) {
+        if (String(u.username || "").toLowerCase() === uname) {
+            return { userId: Number(id), username: u.username, firstName: u.firstName, lastName: u.lastName };
+        }
+    }
+    const snap = await db.collection("vips").where("username", "==", t.replace(/^@/, "")).get();
+    if (!snap.empty) {
+        const d = snap.docs[0];
+        return { ...d.data(), userId: Number(d.data().userId || d.id) };
     }
     return null;
 }
@@ -454,6 +719,7 @@ async function sendVipScreen(ctx) {
 // VIP muddati haqida eslatmalar (tugashiga REMINDER_DAYS kun qolganda va tugaganda)
 async function vipReminderJob() {
     const snap = await db.collection("vips").get();
+    fillVipStore(snap); // VIP keshini ham yangilaymiz
     const now = Date.now();
     for (const doc of snap.docs) {
         const d = doc.data();
@@ -490,63 +756,54 @@ async function vipReminderJob() {
 // ─────────────────────────────────────────────
 
 async function getNextCode() {
-    const snap = await db.collection("films").get();
+    await ensureFilmStore();
     let max = 0;
     let width = 4;
-    snap.forEach((d) => {
-        if (/^\d+$/.test(d.id)) {
-            max = Math.max(max, parseInt(d.id, 10));
-            width = Math.max(width, d.id.length);
+    for (const id of filmStore.keys()) {
+        if (/^\d+$/.test(id)) {
+            max = Math.max(max, parseInt(id, 10));
+            width = Math.max(width, id.length);
         }
-    });
+    }
     return String(max + 1).padStart(width, "0");
 }
 
 async function getMaxEpNo(dramaId, fallback) {
-    const snap = await db.collection("films").where("dramaId", "==", dramaId).get();
+    await ensureFilmStore();
     let max = fallback || 0;
-    snap.forEach((d) => {
-        const n = d.data().epNo;
-        if (typeof n === "number" && n > max) max = n;
+    filmsOfDrama(dramaId).forEach(({ f }) => {
+        if (typeof f.epNo === "number" && f.epNo > max) max = f.epNo;
     });
     return max;
 }
 
 // VIP uchun yopiq qismlar soni VIP_AHEAD dan oshsa, eng eskilari hammaga ochiladi
+// Berilgan qismlarni hammaga ochadi (bazada va keshda), ochilganlar ro'yxatini qaytaradi
+async function openEpisodes(list) {
+    if (list.length === 0) return [];
+    const now = admin.firestore.Timestamp.now();
+    const batch = db.batch();
+    list.forEach(({ code }) => batch.update(db.collection("films").doc(code), { vipOnly: false, openedAt: now }));
+    await batch.commit();
+    list.forEach(({ code }) => storePatchFilm(code, { vipOnly: false, openedAt: now }));
+    return list.map(({ code, f }) => ({ code, episode: f.episode || "", epNo: f.epNo, title: f.title || "" }));
+}
+
+// VIP uchun yopiq qismlar soni VIP_AHEAD dan oshsa, eng eskilari hammaga ochiladi
 async function applyVipWindow(dramaId) {
-    const snap = await db.collection("films").where("dramaId", "==", dramaId).get();
-    const vipEps = snap.docs
-        .filter((d) => d.data().vipOnly === true)
-        .sort((a, b) => (a.data().epNo || 0) - (b.data().epNo || 0));
+    await ensureFilmStore();
+    const vipEps = filmsOfDrama(dramaId)
+        .filter(({ f }) => f.vipOnly === true)
+        .sort((a, b) => (a.f.epNo || 0) - (b.f.epNo || 0));
     const excess = vipEps.length - VIP_AHEAD;
     if (excess <= 0) return [];
-
-    const toOpen = vipEps.slice(0, excess);
-    const batch = db.batch();
-    toOpen.forEach((d) => batch.update(d.ref, { vipOnly: false, openedAt: admin.firestore.Timestamp.now() }));
-    await batch.commit();
-    return toOpen.map((d) => ({
-        code: d.id,
-        episode: d.data().episode || "",
-        epNo: d.data().epNo,
-        title: d.data().title || "",
-    }));
+    return openEpisodes(vipEps.slice(0, excess));
 }
 
 // Ochilgan qismlar ro'yxatini qaytaradi
 async function openAllEpisodes(dramaId) {
-    const snap = await db.collection("films").where("dramaId", "==", dramaId).get();
-    const closed = snap.docs.filter((d) => d.data().vipOnly === true);
-    if (closed.length === 0) return [];
-    const batch = db.batch();
-    closed.forEach((d) => batch.update(d.ref, { vipOnly: false, openedAt: admin.firestore.Timestamp.now() }));
-    await batch.commit();
-    return closed.map((d) => ({
-        code: d.id,
-        episode: d.data().episode || "",
-        epNo: d.data().epNo,
-        title: d.data().title || "",
-    }));
+    await ensureFilmStore();
+    return openEpisodes(filmsOfDrama(dramaId).filter(({ f }) => f.vipOnly === true));
 }
 
 function makeTemplate(film, code) {
@@ -587,8 +844,9 @@ function buildCaption(film, views) {
     return caption;
 }
 
+// Ko'rish soni darhol bazaga yozilmaydi: xotirada yig'ilib, har 20 daqiqada yoziladi
 async function incrementViewCount(filmId) {
-    await db.collection("films").doc(filmId).update({ views: admin.firestore.FieldValue.increment(1) });
+    addView(filmId);
 }
 
 // ─────────────────────────────────────────────
@@ -660,8 +918,7 @@ async function acceptEpisodeCode(ctx, code) {
     if (!isValidCode(code)) {
         return ctx.reply("❌ Kod noto'g'ri (\"/\" belgisi bo'lmasligi va juda uzun bo'lmasligi kerak). Boshqa kod yuboring:");
     }
-    const existing = await db.collection("films").doc(code).get();
-    if (existing.exists) {
+    if (await getFilm(code)) {
         return ctx.reply(`⚠️ "${code}" kodi band. Boshqa kod yuboring:`);
     }
 
@@ -685,10 +942,10 @@ async function acceptEpisodeNumber(ctx, epNo, label) {
         delete userStates[userId];
         return ctx.reply("❌ Ma'lumot topilmadi. Qaytadan boshlang.");
     }
-    const snap = await db.collection("films").where("dramaId", "==", draft.dramaId).get();
-    const dup = snap.docs.find((d) => d.data().epNo === epNo);
+    await ensureFilmStore();
+    const dup = filmsOfDrama(draft.dramaId).find(({ f }) => f.epNo === epNo);
     if (dup) {
-        return ctx.reply(`❌ ${epNo}-qism allaqachon mavjud (kod: ${dup.id}). Boshqa raqam yuboring:`);
+        return ctx.reply(`❌ ${epNo}-qism allaqachon mavjud (kod: ${dup.code}). Boshqa raqam yuboring:`);
     }
     draft.episode = label;
     draft.epNo = epNo;
@@ -726,6 +983,7 @@ async function finalizeFilm(ctx, fileId) {
     let opened = [];
     try {
         await db.collection("films").doc(draft.code).set(filmData);
+        storePutFilm(draft.code, filmData);
         if (filmData.vipOnly) opened = await applyVipWindow(filmData.dramaId);
     } catch (err) {
         console.error("Qism saqlashda xatolik:", err);
@@ -831,13 +1089,12 @@ async function sendAdvOne(uid, adv) {
 }
 
 async function sendAdvToAll(ctx, adv) {
-    const usersSnapshot = await db.collection("users").get();
+    await ensureUserStore();
     const vipIds = await getActiveVipIds();
     let success = 0, failed = 0, skipped = 0;
 
-    for (const docSnap of usersSnapshot.docs) {
-        const user = docSnap.data();
-        const uid = user.userId || Number(docSnap.id);
+    for (const id of [...userStore.keys()]) {
+        const uid = Number(id);
 
         if (vipIds.has(String(uid))) {
             skipped++;
@@ -859,7 +1116,7 @@ async function sendAdvToAll(ctx, adv) {
             success++;
         } catch (error) {
             if (error.response && error.response.error_code === 403) {
-                await db.collection("users").doc(String(uid)).delete().catch(() => { });
+                await removeBlockedUser(uid);
                 console.log(`${uid} bazadan o'chirildi (bloklagan)`);
             }
             failed++;
@@ -875,28 +1132,6 @@ async function sendAdvToAll(ctx, adv) {
 // ─────────────────────────────────────────────
 // MIDDLEWARE: oddiy foydalanuvchi menyu tugmasini bossa, kutish holati bekor bo'ladi
 // ─────────────────────────────────────────────
-
-// Statistika uchun: foydalanuvchi faolligini kuniga bir marta yozib qo'yamiz
-const lastTouchDay = new Map();
-function touchUser(from) {
-    if (!from || from.is_bot) return;
-    const day = fmtDate(Date.now());
-    if (lastTouchDay.get(from.id) === day) return;
-    lastTouchDay.set(from.id, day);
-    db.collection("users")
-        .doc(String(from.id))
-        .set(
-            {
-                userId: from.id,
-                firstName: from.first_name || "",
-                lastName: from.last_name || "",
-                username: from.username || "",
-                lastActiveAt: admin.firestore.Timestamp.now(),
-            },
-            { merge: true }
-        )
-        .catch((err) => console.error("touchUser:", err.message));
-}
 
 bot.use(async (ctx, next) => {
     const text = ctx.message && ctx.message.text;
@@ -920,9 +1155,20 @@ bot.start(async (ctx) => {
     delete editTarget[userId];
 
     const userRef = db.collection("users").doc(userId.toString());
-    const doc = await userRef.get();
+    // Kesh yuklangan bo'lsa, bazani o'qimaymiz
+    const known = userStoreReady && userStore.has(String(userId));
+    const doc = known ? null : await userRef.get();
 
-    if (!doc.exists || !doc.data().joinedAt) {
+    if (!known && (!doc.exists || !doc.data().joinedAt)) {
+        if (userStoreReady) {
+            userStore.set(String(userId), {
+                joinedMs: Date.now(),
+                notifyOff: false,
+                username: ctx.from.username || "",
+                firstName: ctx.from.first_name || "",
+                lastName: ctx.from.last_name || "",
+            });
+        }
         await userRef.set(
             {
                 userId,
@@ -1215,11 +1461,10 @@ bot.action("vipadm_stats", async (ctx) => {
     await ctx.answerCbQuery();
 
     const now = Date.now();
-    const vipSnap = await db.collection("vips").get();
+    await ensureVipStore();
     let active = 0;
-    vipSnap.forEach((d) => {
-        if (tsToMs(d.data().expiresAt) > now) active++;
-    });
+    for (const exp of vipStore.values()) if (exp > now) active++;
+    const vipSnap = { size: vipStore.size };
 
     const paySnap = await db.collection("payments").get();
     let pending = 0, approved = 0, rejected = 0, adminGrants = 0, freeGrants = 0;
@@ -1800,7 +2045,6 @@ const DRAMAS_PER_PAGE = 10;       // ro'yxatning bitta sahifasidagi dramalar
 const EPISODES_PER_PAGE = 30;     // bitta sahifadagi qism tugmalari (Telegram limiti: 100)
 const EP_BUTTONS_PER_ROW = 3;     // bir qatordagi qism tugmalari
 const SEARCH_LIMIT = 20;          // izlashda ko'rsatiladigan dramalar soni
-const DRAMA_CACHE_MS = 2 * 60 * 1000;
 
 let dramaCache = { at: 0, groups: null };
 
@@ -1847,16 +2091,14 @@ function botUsername(ctx) {
 
 // Qismlarni drama nomi bo'yicha guruhlaydi (2 daqiqa keshlanadi)
 async function loadDramaGroups(force = false) {
-    if (!force && dramaCache.groups && Date.now() - dramaCache.at < DRAMA_CACHE_MS) {
-        return dramaCache.groups;
-    }
+    await ensureFilmStore();
+    if (!force && dramaCache.groups) return dramaCache.groups;
 
-    const snap = await db.collection("films").get();
     const groups = new Map();
     const INFO_FIELDS = ["year", "genre", "translator", "language", "description"];
 
-    snap.forEach((doc) => {
-        const d = doc.data();
+    filmStore.forEach((d, docId) => {
+        const doc = { id: docId };
         const title = String(d.title || "").trim() || "Nomsiz";
         const key = dramaKey(title);
         if (!groups.has(key)) groups.set(key, { title, info: {}, eps: [] });
@@ -2036,10 +2278,8 @@ async function showSearchResults(ctx, groups, matches, query) {
 // Kod bo'yicha qism topilmasa false qaytaradi.
 async function sendEpisode(ctx, code) {
     const userId = ctx.from.id;
-    if (!isValidCode(code)) return false;
-    const filmDoc = await db.collection("films").doc(code).get();
-    if (!filmDoc.exists) return false;
-    const film = filmDoc.data();
+    const film = await getFilm(code);
+    if (!film) return false;
 
     let groups = await loadDramaGroups();
     let group = findGroupByCode(groups, code);
@@ -2329,12 +2569,12 @@ async function runNotify(entry) {
             ? buildNotifyMessage(groups, group, isNewDrama && allEps.length > 0, allEps, openedEps, false)
             : null;
 
-    const [usersSnap, vipIds] = await Promise.all([db.collection("users").get(), getActiveVipIds()]);
+    await ensureUserStore();
+    const vipIds = await getActiveVipIds();
     let success = 0, failed = 0, muted = 0;
 
-    for (const docSnap of usersSnap.docs) {
-        const u = docSnap.data();
-        const uid = Number(u.userId || docSnap.id);
+    for (const [id, u] of [...userStore.entries()]) {
+        const uid = Number(id);
         if (!uid || uid === ADMIN_ID) continue;
         if (u.notifyOff === true) {
             muted++;
@@ -2348,7 +2588,7 @@ async function runNotify(entry) {
             success++;
         } catch (error) {
             if (error.response && error.response.error_code === 403) {
-                await docSnap.ref.delete().catch(() => { });
+                await removeBlockedUser(uid);
             }
             failed++;
         }
@@ -2389,6 +2629,7 @@ bot.action(/^ntf_cancel:(.+)$/, async (ctx) => {
 // Foydalanuvchi: xabarnomalarni o'chirish / yoqish
 bot.action("notif_off", async (ctx) => {
     await db.collection("users").doc(String(ctx.from.id)).set({ notifyOff: true }, { merge: true });
+    if (userStore.has(String(ctx.from.id))) userStore.get(String(ctx.from.id)).notifyOff = true;
     await ctx.answerCbQuery("🔕 O'chirildi");
     await ctx.reply(
         "🔕 Yangi qismlar haqidagi xabarnomalar o'chirildi.",
@@ -2398,6 +2639,7 @@ bot.action("notif_off", async (ctx) => {
 
 bot.action("notif_on", async (ctx) => {
     await db.collection("users").doc(String(ctx.from.id)).set({ notifyOff: false }, { merge: true });
+    if (userStore.has(String(ctx.from.id))) userStore.get(String(ctx.from.id)).notifyOff = false;
     await ctx.answerCbQuery("🔔 Yoqildi");
     await clearInlineButtons(ctx);
     await ctx.reply("🔔 Xabarnomalar yoqildi! Yangi qismlar chiqqanda sizga xabar beramiz.");
@@ -2419,12 +2661,11 @@ const EDIT_FIELDS = {
 };
 
 async function showEditMenu(ctx, code) {
-    const doc = await db.collection("films").doc(code).get();
-    if (!doc.exists) return ctx.reply("❌ Bu qism topilmadi (o'chirilgan bo'lishi mumkin).");
+    const f = await getFilm(code);
+    if (!f) return ctx.reply("❌ Bu qism topilmadi (o'chirilgan bo'lishi mumkin).");
     if (!cbFits(`eddelok:${code}`)) {
         return ctx.reply("❌ Bu qism kodi juda uzun, tugmalar orqali tahrirlab bo'lmaydi.");
     }
-    const f = doc.data();
     const groups = await loadDramaGroups();
     const group = findGroupByCode(groups, code);
     const val = (v) => (v ? esc(shorten(v, 200)) : "<i>kiritilmagan</i>");
@@ -2485,9 +2726,8 @@ bot.action(/^ed:(t|e|y|tr|l|g|d|v):(.+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const field = ctx.match[1];
     const code = ctx.match[2];
-    const doc = await db.collection("films").doc(code).get();
-    if (!doc.exists) return ctx.reply("❌ Bu qism topilmadi.");
-    const f = doc.data();
+    const f = await getFilm(code);
+    if (!f) return ctx.reply("❌ Bu qism topilmadi.");
 
     editTarget[ctx.from.id] = { code, field };
     userStates[ctx.from.id] = field === "v" ? "waiting_for_edit_video" : "waiting_for_edit_value";
@@ -2522,8 +2762,7 @@ async function applyEditValue(ctx, value) {
         return ctx.reply("❌ Seans tugagan. «✏️ Qismni tahrirlash» orqali qaytadan boshlang.");
     }
     const ref = db.collection("films").doc(t.code);
-    const snap = await ref.get();
-    if (!snap.exists) {
+    if (!(await getFilm(t.code))) {
         delete userStates[adminId];
         delete editTarget[adminId];
         return ctx.reply("❌ Bu qism topilmadi (o'chirilgan bo'lishi mumkin).");
@@ -2544,6 +2783,7 @@ async function applyEditValue(ctx, value) {
                 codes.slice(i, i + 400).forEach((c) => batch.update(db.collection("films").doc(c), { title }));
                 await batch.commit();
             }
+            codes.forEach((c) => storePatchFilm(c, { title }));
             note = ` (${codes.length} ta qismda)`;
         } else if (t.field === "e") {
             const label = normalizeEpisode(value);
@@ -2554,14 +2794,17 @@ async function applyEditValue(ctx, value) {
             const dup = group && group.eps.find((e) => e.code !== t.code && e.epNo === epNo);
             if (dup) return ctx.reply(`❌ ${epNo}-qism allaqachon bor (kod: ${dup.code}). Boshqa raqam yuboring:`);
             await ref.update({ episode: label, epNo });
+            storePatchFilm(t.code, { episode: label, epNo });
         } else if (t.field === "v") {
             await ref.update({ video_link: value });
+            storePatchFilm(t.code, { video_link: value });
         } else {
             let v = String(value).trim();
             if (v === "-") v = "";
             if (t.field === "d" && v.length > 3000) v = v.slice(0, 3000);
             if (t.field !== "d" && v.length > 200) v = v.slice(0, 200);
             await ref.update({ [field.key]: v });
+            storePatchFilm(t.code, { [field.key]: v });
         }
     } catch (err) {
         console.error("Tahrirlashda xatolik:", err);
@@ -2579,15 +2822,13 @@ bot.action(/^edvip:(.+)$/, async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
     const code = ctx.match[1];
     const ref = db.collection("films").doc(code);
-    const snap = await ref.get();
-    if (!snap.exists) return ctx.answerCbQuery("❌ Qism topilmadi.");
-    const f = snap.data();
+    const f = await getFilm(code);
+    if (!f) return ctx.answerCbQuery("❌ Qism topilmadi.");
     const makeVip = f.vipOnly !== true;
 
-    await ref.update(
-        makeVip ? { vipOnly: true } : { vipOnly: false, openedAt: admin.firestore.Timestamp.now() }
-    );
-    invalidateDramaCache();
+    const patch = makeVip ? { vipOnly: true } : { vipOnly: false, openedAt: admin.firestore.Timestamp.now() };
+    await ref.update(patch);
+    storePatchFilm(code, patch);
     if (!makeVip) enqueueNotify({ code, episode: f.episode, epNo: f.epNo, title: f.title }, "opened");
 
     await ctx.answerCbQuery(
@@ -2602,9 +2843,8 @@ bot.action(/^eddel:(.+)$/, async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
     await ctx.answerCbQuery();
     const code = ctx.match[1];
-    const snap = await db.collection("films").doc(code).get();
-    if (!snap.exists) return ctx.reply("❌ Bu qism topilmadi.");
-    const f = snap.data();
+    const f = await getFilm(code);
+    if (!f) return ctx.reply("❌ Bu qism topilmadi.");
     await showOrEdit(
         ctx,
         `🗑 <b>${esc(f.title || "Drama")}</b>${f.episode ? " · " + esc(f.episode) : ""} (kod: <code>${esc(code)}</code>)\n\n` +
@@ -2620,14 +2860,13 @@ bot.action(/^eddelok:(.+)$/, async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
     const code = ctx.match[1];
     const ref = db.collection("films").doc(code);
-    const snap = await ref.get();
-    if (!snap.exists) {
+    const f = await getFilm(code);
+    if (!f) {
         await ctx.answerCbQuery("ℹ️ Allaqachon o'chirilgan.");
         return clearInlineButtons(ctx);
     }
-    const f = snap.data();
     await ref.delete();
-    invalidateDramaCache();
+    storeDeleteFilm(code);
     removeFromNotify(code);
     await ctx.answerCbQuery("🗑 O'chirildi");
     await showOrEdit(
@@ -2665,32 +2904,37 @@ async function showBotStats(ctx) {
     const d7 = now - 7 * DAY_MS;
     const d30 = now - 30 * DAY_MS;
 
-    const [usersSnap, filmsSnap, vipSnap, paySnap] = await Promise.all([
-        db.collection("users").get(),
-        db.collection("films").get(),
-        db.collection("vips").get(),
-        db.collection("payments").get(),
-    ]);
+    await Promise.all([ensureUserStore(), ensureFilmStore(), ensureVipStore()]);
+    const paySnap = await db.collection("payments").get();
 
-    let total = 0, newToday = 0, new7 = 0, new30 = 0, actToday = 0, act7 = 0, muted = 0;
-    usersSnap.forEach((d) => {
-        const u = d.data();
+    let total = 0, newToday = 0, new7 = 0, new30 = 0, muted = 0;
+    for (const u of userStore.values()) {
         total++;
-        const j = tsToMs(u.joinedAt);
+        const j = u.joinedMs;
         if (j >= dayStart) newToday++;
         if (j >= d7) new7++;
         if (j >= d30) new30++;
-        const a = tsToMs(u.lastActiveAt);
-        if (a >= dayStart) actToday++;
-        if (a >= d7) act7++;
-        if (u.notifyOff === true) muted++;
+        if (u.notifyOff) muted++;
+    }
+
+    // Faollik: bugungisi xotiradan, oldingi 6 kun — kunlik hujjatlardan (6 o'qish)
+    const actToday = activity.day === fmtDate(now) ? activity.ids.size : 0;
+    const week = new Set(activity.day === fmtDate(now) ? activity.ids : []);
+    const pastDays = [];
+    for (let i = 1; i <= 6; i++) pastDays.push(fmtDate(now - i * DAY_MS));
+    const pastDocs = await Promise.all(
+        pastDays.map((day) => db.collection("stats").doc(activityDocId(day)).get().catch(() => null))
+    );
+    pastDocs.forEach((d) => {
+        if (d && d.exists && Array.isArray(d.data().ids)) d.data().ids.forEach((id) => week.add(id));
     });
+    const act7 = week.size;
 
     let episodes = 0, vipEpisodes = 0, totalViews = 0;
     const eps = [];
     const dramas = new Map();
-    filmsSnap.forEach((d) => {
-        const f = d.data();
+    filmStore.forEach((f, id) => {
+        const d = { id };
         const views = Number(f.views) || 0;
         episodes++;
         if (f.vipOnly === true) vipEpisodes++;
@@ -2704,9 +2948,7 @@ async function showBotStats(ctx) {
     });
 
     let activeVip = 0;
-    vipSnap.forEach((d) => {
-        if (tsToMs(d.data().expiresAt) > now) activeVip++;
-    });
+    for (const exp of vipStore.values()) if (exp > now) activeVip++;
 
     let revToday = 0, rev30 = 0, revAll = 0, pending = 0;
     paySnap.forEach((d) => {
@@ -2752,7 +2994,7 @@ async function showBotStats(ctx) {
             text += `\n${i + 1}. ${esc(shorten(g.title, 40))} — 👁 ${formatSum(g.views)} (${g.count} qism)`;
         });
     }
-    text += `\n\nℹ️ "Faol" ko'rsatkichi shu yangilanishdan boshlab yig'iladi.`;
+    text += `\n\nℹ️ "Faol" ko'rsatkichi shu yangilanishdan boshlab yig'iladi. Ko'rishlar soni bazaga har 20 daqiqada yoziladi.`;
 
     return showOrEdit(ctx, text, [[Markup.button.callback("🔄 Yangilash", "stats_refresh")]]);
 }
@@ -2802,9 +3044,9 @@ bot.on("text", async (ctx) => {
             if (!isValidCode(code)) {
                 return ctx.reply("❌ Kod noto'g'ri (\"/\" belgisi bo'lmasligi va juda uzun bo'lmasligi kerak). Boshqa kod yuboring:");
             }
-            const existing = await db.collection("films").doc(code).get();
+            const existing = await getFilm(code);
             filmDrafts[userId] = { code, dramaId: code };
-            if (existing.exists) {
+            if (existing) {
                 return ctx.reply(
                     `⚠️ "${code}" kodli drama allaqachon mavjud. Ustidan yozilsinmi?`,
                     Markup.inlineKeyboard([
@@ -2831,16 +3073,16 @@ bot.on("text", async (ctx) => {
         // Qism qo'shish: namuna qism kodi
         if (state === "waiting_for_ep_base") {
             if (!isValidCode(text)) return ctx.reply("❌ Bunday kodli drama topilmadi. Qaytadan yuboring:");
-            const baseDoc = await db.collection("films").doc(text).get();
-            if (!baseDoc.exists) return ctx.reply("❌ Bunday kodli drama topilmadi. Qaytadan yuboring:");
+            const b = await getFilm(text);
+            if (!b) return ctx.reply("❌ Bunday kodli drama topilmadi. Qaytadan yuboring:");
 
-            const b = baseDoc.data();
             const baseEp = typeof b.epNo === "number" ? b.epNo : parseEpNo(b.episode) || 1;
             const dramaId = b.dramaId || text;
 
             // Eski (guruhlanmagan) qism bo'lsa, unga drama ID va qism raqamini yozib qo'yamiz
             if (!b.dramaId || typeof b.epNo !== "number") {
-                await baseDoc.ref.set({ dramaId, epNo: baseEp }, { merge: true });
+                await db.collection("films").doc(text).set({ dramaId, epNo: baseEp }, { merge: true });
+                storePatchFilm(text, { dramaId, epNo: baseEp });
             }
 
             const lastEpNo = await getMaxEpNo(dramaId, baseEp);
@@ -2939,6 +3181,7 @@ bot.on("text", async (ctx) => {
                     return ctx.reply(`ℹ️ ${displayName(target)} VIP emas.`);
                 }
                 await vipRef.delete();
+                vipStore.delete(String(target.userId));
                 delete userStates[userId];
                 return ctx.reply(`✅ ${displayName(target)} dan VIP olib tashlandi.`);
             }
@@ -2985,7 +3228,7 @@ bot.on("text", async (ctx) => {
 
         // Qismni tahrirlash: kod kutilmoqda
         if (state === "waiting_for_edit_code") {
-            if (!isValidCode(text) || !(await db.collection("films").doc(text).get()).exists) {
+            if (!(await getFilm(text))) {
                 return ctx.reply("❌ Bunday kodli qism topilmadi. Kodni qayta yuboring:");
             }
             delete userStates[userId];
@@ -3066,13 +3309,27 @@ bot.action("cancel_adv_text", async (ctx) => {
 // XATOLARNI USHLASH
 // ─────────────────────────────────────────────
 
+const busyNotified = new Map(); // userId -> oxirgi "band" xabari vaqti
+let lastQuotaLog = 0;
+
 bot.catch(async (err, ctx) => {
+    // Firestore limiti tugagan: logni to'ldirmaymiz, foydalanuvchiga qisqa xabar
+    if (isQuotaError(err)) {
+        if (Date.now() - lastQuotaLog > 5 * 60 * 1000) {
+            lastQuotaLog = Date.now();
+            console.error("⚠️ Firestore kunlik limiti tugagan (RESOURCE_EXHAUSTED). Limit Toshkent vaqti bilan ~13:00 da yangilanadi.");
+        }
+        const id = ctx && ctx.from && ctx.from.id;
+        if (id && Date.now() - (busyNotified.get(id) || 0) > 10 * 60 * 1000) {
+            busyNotified.set(id, Date.now());
+            await ctx.reply("⚠️ Bot hozir juda band. Iltimos, birozdan keyin qayta urinib ko'ring 🙏").catch(() => { });
+        }
+        return;
+    }
     console.error("BOT ERROR:", err);
     if (err.response && err.response.error_code === 403) {
         const id = ctx && ctx.from && ctx.from.id;
-        if (id) {
-            await db.collection("users").doc(id.toString()).delete().catch(() => { });
-        }
+        if (id) await removeBlockedUser(id);
     }
 });
 
@@ -3080,24 +3337,47 @@ bot.catch(async (err, ctx) => {
 // ISHGA TUSHIRISH
 // ─────────────────────────────────────────────
 
-(async () => {
+// Ishga tushirish: xato bo'lsa bot o'chib qolmaydi (aks holda server uni qayta-qayta
+// ishga tushirib, har safar bazani o'qib, limitni tezroq tugatadi) — 10 daqiqadan keyin qayta uriniladi
+async function initData() {
     try {
         await seedChannelsIfEmpty();
         await loadChannels();
         await loadDownloadUsers();
+        await ensureFilmStore();
+        await ensureVipStore();
         await backfillManualVipPayments().catch((e) => console.error("backfillManualVipPayments:", e.message));
+        console.log("✅ Ma'lumotlar yuklandi.");
     } catch (err) {
-        console.error("Ishga tushirishda xatolik:", err);
-        process.exit(1);
+        console.error(
+            isQuotaError(err)
+                ? "⚠️ Firestore limiti tugagan, ma'lumotlar 10 daqiqadan keyin qayta yuklanadi."
+                : "Ma'lumotlarni yuklashda xatolik, 10 daqiqadan keyin qayta urinamiz: " + err.message
+        );
+        setTimeout(initData, 10 * 60 * 1000);
     }
+}
 
-    // VIP eslatmalari: ishga tushgandan 30 soniya keyin, so'ng har 6 soatda
+(async () => {
+    await initData();
+
+    // VIP eslatmalari: ishga tushgandan 2 daqiqa keyin, so'ng har 6 soatda
     const runReminders = () => vipReminderJob().catch((e) => console.error("vipReminderJob:", e.message));
-    setTimeout(runReminders, 30 * 1000);
+    setTimeout(runReminders, 2 * 60 * 1000);
     setInterval(runReminders, 6 * 60 * 60 * 1000);
 
-    process.once("SIGINT", () => { try { bot.stop("SIGINT"); } catch (e) { } });
-    process.once("SIGTERM", () => { try { bot.stop("SIGTERM"); } catch (e) { } });
+    // Ko'rishlar va faollikni guruhlab yozish
+    setInterval(() => flushViews().catch((e) => console.error("flushViews:", e.message)), VIEW_FLUSH_MS);
+    setInterval(() => saveActivity(activity).catch(() => { }), ACTIVITY_FLUSH_MS);
+
+    // To'xtatishda yig'ilgan ma'lumotlarni yozib qo'yamiz
+    const shutdown = async (signal) => {
+        try { bot.stop(signal); } catch (e) { }
+        await flushAllCaches();
+        process.exit(0);
+    };
+    process.once("SIGINT", () => shutdown("SIGINT"));
+    process.once("SIGTERM", () => shutdown("SIGTERM"));
 
     console.log("🚀 SeoulFlix Bot ishga tushmoqda...");
     await bot.launch();
