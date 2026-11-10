@@ -70,8 +70,10 @@ const FILM_OPTIONAL_STEPS = [
     { key: "description", label: "📕 Tavsifini yuboring:" },
 ];
 
-let CHECK_CHANNELS = [];
-let SHOW_CHANNELS = [];
+let CHECK_CHANNELS = [];  // obunasi tekshiriladigan Telegram kanallar
+let SHOW_CHANNELS = [];   // obuna xabarida ko'rsatiladigan barcha tugmalar (kanallar + Instagram kabi havolalar)
+let CHANNEL_DOCS = [];    // admin ro'yxati uchun
+const channelDrafts = {}; // admin: qo'shilayotgan havola
 let DOWNLOAD_USERNAMES = new Set(); // videoni himoyasiz oladiganlar (eski "vipUsers" kolleksiyasi)
 
 // ─────────────────────────────────────────────
@@ -451,10 +453,18 @@ async function loadDownloadUsers() {
     DOWNLOAD_USERNAMES = new Set(snapshot.docs.map((doc) => doc.id));
 }
 
+// type: "link" bo'lgan yozuvlar (masalan Instagram) faqat tugma sifatida ko'rsatiladi,
+// obunasi tekshirilmaydi — bosmasa ham bot ishlayveradi.
 async function loadChannels() {
     const snapshot = await db.collection("channels").get();
-    CHECK_CHANNELS = snapshot.docs.map((doc) => doc.data().channelId);
-    SHOW_CHANNELS = snapshot.docs.map((doc) => ({ name: doc.data().name, url: doc.data().url }));
+    const docs = snapshot.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
+    const telegram = docs.filter((c) => c.type !== "link" && c.channelId);
+    const links = docs.filter((c) => c.type === "link" && c.url);
+    CHECK_CHANNELS = telegram.map((c) => c.channelId);
+    SHOW_CHANNELS = [...telegram, ...links]
+        .filter((c) => c.url)
+        .map((c) => ({ name: c.name || c.channelId || "Havola", url: c.url }));
+    CHANNEL_DOCS = [...telegram, ...links];
 }
 
 async function seedChannelsIfEmpty() {
@@ -1876,13 +1886,14 @@ bot.hears(BTN.CHANNELS, async (ctx) => {
 bot.action("channels_list", async (ctx) => {
     if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
     await ctx.answerCbQuery();
-    if (CHECK_CHANNELS.length === 0) return ctx.reply("📭 Hozircha majburiy kanallar yo'q.");
-    let msg = "📋 *Majburiy kanallar ro'yxati:*\n";
-    CHECK_CHANNELS.forEach((id, i) => {
-        const show = SHOW_CHANNELS[i];
-        msg += `\n${i + 1}. ${(show && show.name) || id} — \`${id}\``;
+    if (CHANNEL_DOCS.length === 0) return ctx.reply("📭 Hozircha majburiy kanallar yo'q.");
+    let msg = "📋 <b>Majburiy kanallar ro'yxati:</b>\n";
+    CHANNEL_DOCS.forEach((c, i) => {
+        msg += c.type === "link"
+            ? `\n${i + 1}. ${esc(c.name)} — ${esc(c.url)} <i>(faqat ko'rsatiladi, tekshirilmaydi)</i>`
+            : `\n${i + 1}. ${esc(c.name || c.channelId)} — <code>${esc(c.channelId)}</code>`;
     });
-    await ctx.reply(msg, { parse_mode: "Markdown" });
+    await ctx.reply(msg, { parse_mode: "HTML", disable_web_page_preview: true });
 });
 
 bot.action("channels_add", async (ctx) => {
@@ -1890,9 +1901,40 @@ bot.action("channels_add", async (ctx) => {
     await ctx.answerCbQuery();
     userStates[ctx.from.id] = "waiting_for_channel_add";
     await ctx.reply(
-        "➕ *Yangi kanal qo'shish*\n\nKanalning username'ini yuboring (masalan: @kanal_nomi).\n\n⚠️ Botni avval o'sha kanalga *admin* qilib qo'shing, aks holda obuna tekshiruvi ishlamaydi.",
-        { parse_mode: "Markdown" }
+        "➕ <b>Yangi kanal qo'shish</b>\n\n" +
+        "• <b>Telegram kanal</b> — username'ini yuboring (masalan: @kanal_nomi). Obunasi tekshiriladi.\n" +
+        "⚠️ Botni avval o'sha kanalga <b>admin</b> qilib qo'shing.\n\n" +
+        "• <b>Instagram yoki boshqa sahifa</b> — havolasini yuboring (masalan: https://instagram.com/sahifa). " +
+        "U obuna xabarida tugma bo'lib chiqadi, lekin tekshirilmaydi: bosmasa ham bot ishlayveradi.",
+        { parse_mode: "HTML", disable_web_page_preview: true }
     );
+});
+
+async function saveLinkChannel(ctx, name) {
+    const userId = ctx.from.id;
+    const draft = channelDrafts[userId];
+    if (!draft) {
+        delete userStates[userId];
+        return ctx.reply("❌ Seans tugagan. «📡 Majburiy kanallar» orqali qaytadan boshlang.");
+    }
+    name = String(name || "").trim();
+    if (!name || name.length > 40) return ctx.reply("❌ Nom 1–40 belgi bo'lishi kerak. Qayta yozing:");
+
+    await db.collection("channels").add({ type: "link", name, url: draft.url });
+    await loadChannels();
+    delete userStates[userId];
+    delete channelDrafts[userId];
+    return ctx.reply(
+        `✅ Qo'shildi: ${name}\n\nU obuna xabarida boshqa kanallar bilan birga chiqadi. Obunasi tekshirilmaydi — bosmagan foydalanuvchi ham kod yozib dramani ko'ra oladi.`
+    );
+}
+
+bot.action("linkname_insta", async (ctx) => {
+    if (ctx.from.id !== ADMIN_ID) return ctx.answerCbQuery("❌ Ruxsat yo'q.");
+    if (userStates[ctx.from.id] !== "waiting_for_link_name") return ctx.answerCbQuery("Amal muddati o'tgan.");
+    await ctx.answerCbQuery();
+    await clearInlineButtons(ctx);
+    await saveLinkChannel(ctx, "📸 Instagram");
 });
 
 bot.action("channels_remove_menu", async (ctx) => {
@@ -1902,7 +1944,7 @@ bot.action("channels_remove_menu", async (ctx) => {
     if (snapshot.empty) return ctx.reply("📭 Hozircha majburiy kanallar yo'q.");
     const buttons = snapshot.docs.map((doc) => {
         const data = doc.data();
-        return [Markup.button.callback(`🗑 ${data.name || data.channelId}`, `remove_channel:${doc.id}`)];
+        return [Markup.button.callback(`🗑 ${data.name || data.channelId}`.slice(0, 60), `remove_channel:${doc.id}`)];
     });
     await ctx.reply("O'chirmoqchi bo'lgan kanalni tanlang:", Markup.inlineKeyboard(buttons));
 });
@@ -3209,11 +3251,37 @@ bot.on("text", async (ctx) => {
             }
         }
 
+        // Instagram kabi havola uchun tugma nomi
+        if (state === "waiting_for_link_name") {
+            return saveLinkChannel(ctx, text);
+        }
+
         // Yangi majburiy kanal qo'shish
         if (state === "waiting_for_channel_add") {
             const username = text;
+
+            // Instagram yoki boshqa sahifa havolasi (tekshirilmaydi, faqat ko'rsatiladi)
             if (!username.startsWith("@")) {
-                return ctx.reply("❌ Username @ bilan boshlanishi kerak. Masalan: @kanal_nomi");
+                let raw = username.trim();
+                if (/^(www\.)?[a-z0-9-]+\.[a-z]{2,}\//i.test(raw)) raw = "https://" + raw;
+                let url;
+                try {
+                    url = new URL(raw);
+                } catch (e) {
+                    url = null;
+                }
+                if (!url || !["http:", "https:"].includes(url.protocol)) {
+                    return ctx.reply(
+                        "❌ Telegram kanal uchun @username, Instagram uchun havola yuboring.\nMasalan: @kanal_nomi yoki https://instagram.com/sahifa"
+                    );
+                }
+                channelDrafts[userId] = { url: url.href };
+                userStates[userId] = "waiting_for_link_name";
+                const isInsta = /instagram\.com$/i.test(url.hostname.replace(/^www\./i, ""));
+                return ctx.reply(
+                    "✏️ Tugmada qanday nom chiqsin? Nomni yozing" + (isInsta ? " yoki pastdagi tugmani bosing:" : ":"),
+                    isInsta ? Markup.inlineKeyboard([[Markup.button.callback("📸 Instagram", "linkname_insta")]]) : {}
+                );
             }
             try {
                 const chat = await bot.telegram.getChat(username);
